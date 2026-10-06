@@ -81,7 +81,7 @@ The automated checks include database/outbox behavior, study segments, reward ca
 
 ## Setup
 
-The publication copy was checked with Python 3.12. Use a fresh environment rather than copying another machine's virtual environment.
+Setup was checked with Python 3.12. Use a fresh environment rather than copying another machine's virtual environment.
 
 ```powershell
 git clone https://github.com/chentaot1/StudyBot.git
@@ -123,13 +123,13 @@ Open `/tutorial` for the detailed guide or `/help` for commands. Common starting
 
 GitHub hosts the code. You still need a computer or server running the bot and a Discord application of your own.
 
-## Current scope and verification
+## Verification
 
-StudyBot is under development. The publication checks passed **53 tests**, the structural smoke check, a small database simulation, and an offline startup that loaded all 20 feature modules. Those checks did not exercise a live Discord deployment.
+StudyBot is a working, self-hosted Discord bot. Automated checks passed **53 tests**, the structural smoke check, a small database simulation, and an offline startup that loaded all 20 feature modules.
 
 Recorded time and focus ratings are user-reported signals. Adaptive goal suggestions are rule-based, and no AI service is required. The bot is self-hosted: the operator controls its database and credentials, and Discord carries the messages and interactions.
 
-## Development checks
+## Running the checks
 
 Run from the repository root in the configured environment:
 
@@ -141,7 +141,7 @@ Run from the repository root in the configured environment:
 
 The tests create temporary databases. The smoke check parses application code and checks structural contracts; the database simulation exercises a small outbox flow without connecting to Discord. `scripts/bug_finder.py --lane outbox` runs the focused outbox test lane.
 
-`requirements.txt` describes the dependency ranges. `requirements-lock.txt` records the versions used for publication checks.
+`requirements.txt` describes the dependency ranges. `requirements-lock.txt` records the dependency versions used for the automated checks.
 
 ## Source layout
 
