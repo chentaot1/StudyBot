@@ -1,0 +1,34 @@
+# Credentials and deployment configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# User data, exports, and backups
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.sqlite-*
+*.sqlite3-*
+backups/
+exports/
+*.csv
+*.zip
+
+# Runtime files and environments
+*.log
+*.log.*
+*.pid
+*.lock
+venv/
+.venv/
+.venv*/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+.cursor/
+.vscode/
