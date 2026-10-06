@@ -1,28 +1,83 @@
 # StudyBot
 
-StudyBot is a self-hosted Discord bot that combines study tracking and planning tools with RPG progression. Solo and group Pomodoro sessions feed into a persistent history, while recorded study time can earn XP, points, and shared raid damage. A productivity-only mode keeps the study tools available without the game systems for configured users.
+StudyBot is a self-hosted study and accountability system for Discord. It combines persistent focus tracking with collaborative Pomodoro sessions, a task and review planner, and an RPG economy built around recorded study activity.
 
-The project is written in Python with discord.py, SQLite, and APScheduler. It is under development; the automated checks cover selected database and reward invariants rather than proving every Discord interaction works.
+The systems share the same study history: a completed focus session can update a daily goal, advance a quest, contribute damage to a community raid boss, and appear in a weekly report. Users can also define their own rewards or use a productivity-only mode without the RPG features.
 
-## What it does
+The implementation uses Python, discord.py, SQLite, and APScheduler, with 20 feature modules covering the study workflow, progression, social interactions, and administration.
 
-- **Study sessions:** start a live timer, pause and resume, extend a target, attach notes and tags, or switch subjects without ending the timer. Subject changes are recorded as segments so time can be attributed to the appropriate subject.
-- **Pomodoro:** work and break phases for individual sessions, plus group lobbies with join codes, membership, start votes, and a host-controlled begin command.
-- **Planning:** tasks grouped into projects, bulk task completion with a short undo window, spaced-repetition review tasks, weekday study goals, recurring study blocks, and one-off reminders. Schedules prompt users to study; they do not automatically start a session.
-- **Progress and reflection:** daily snapshots, study streaks, subject and tag breakdowns, weekly activity, focus-hour summaries, and optional evening check-ins with adaptive goal suggestions.
-- **Rewards:** XP tiers and milestone bonuses, levels and prestige, study points, personal reward shops, coins, inventory, potions, daily quests, and badges. Temptation bundling sends a configured reward message after a chosen study or Pomodoro condition is met.
-- **Shared game systems:** raid bosses take damage from recorded study time. Bounties, beacons, cheers, and leaderboards add social incentives. The configurable private `/duo` board is separate from the general leaderboards.
-- **Data and administration:** CSV exports packaged as a ZIP, database backups, owner-only diagnostics, and server allowlisting. Settings include notification controls and options that reduce public visibility of activity.
+## Study and planning
 
-The bot records timer activity and user input. It does not independently verify that someone was studying, and its adaptive suggestions are rule-based rather than an AI service.
+### Focus sessions with a persistent history
 
-## Persistence and recovery
+`/study` provides a live session card with controls for pausing, resuming, adding notes, and stopping. Sessions can have a target, subject, and tags. Users can extend a target or switch subjects while keeping one timer running.
 
-SQLite stores sessions, subject segments, planning records, progression, and scheduled state. Connections enable write-ahead logging and foreign keys, with configurable busy timeouts. Startup includes recovery paths for existing study and Pomodoro state.
+Subject switches create separate session segments. Each segment records its timing and pause offset, allowing subject and tag breakdowns to attribute time within a session rather than assigning the entire session to its final subject. Completed sessions support a focus rating, and the live card shows progress toward the target and upcoming XP bonuses.
 
-A persistent notification outbox supports deduplication keys, claiming, retries, and recovery of stale sending records. Discord delivery and a local database commit are separate operations, so this is not a guarantee of exactly-once delivery. Regression tests also cover repeated bounty use and refunds, reward calculations, group start votes, reminder toggles, and repeated raid-end reward claims.
+Long-running sessions receive an inactivity check with a response window and an automatic stop path. This helps handle forgotten timers; it does not independently establish whether someone was studying.
 
-The gateway watchdog and reconnect loop detect stalled connections and back off after errors. Windows scripts provide optional process supervision through a watchdog or NSSM service. None of these mechanisms replaces testing the bot in the server where it will run.
+### Solo and group Pomodoro
+
+Solo Pomodoro supports configurable work periods, short and long breaks, cycle limits, phase notifications, and skip/stop controls. Work phases connect to study sessions and their reward calculations.
+
+Group Pomodoro adds shared lobbies for up to 10 participants, join codes, a public lobby card, and synchronized work/break phases. A host can begin a session directly. A majority start vote can also begin a waiting lobby with at least three members. Lobbies with at least two members have a one-hour auto-start path with a five-minute warning and a host cancellation control.
+
+Lobby membership and phase timestamps are persisted. Recovery code re-arms group countdowns after a restart or gateway reconnect and transitions overdue phases instead of always restarting the full countdown. Solo timers also have timestamp-based recovery paths.
+
+### Tasks, projects, and spaced repetition
+
+Tasks support priorities, due dates, descriptions, and project grouping. Autocomplete and per-user task numbers keep task selection separate from internal database IDs. Bulk completion supports up to 15 tasks, with a short undo window for individual or batch completions and rollback handling if a batch fails partway through.
+
+Review tasks follow an interval progression from one day up to 60 days. Completing a review creates the next dated review task and carries forward its project and description. The review workflow has its own reward progression and daily reward limits; undo handling also accounts for the next review it created.
+
+Recurring study blocks and one-off reminders connect planning to Discord notifications. Weekday-specific goals let users plan different workloads across the week. Scheduled blocks prompt users to begin; they do not start focus tracking automatically.
+
+### Reflection and adaptive goals
+
+Optional evening check-ins record whether a user studied and can include a note. The history combines check-in responses with recorded study activity. Streak handling includes weekend rules and earned freezes for missed days.
+
+Adaptive goal suggestions use the previous seven days of goal completion. Consistently meeting a goal can prompt a higher target, while frequently missing it can prompt a lower one. Suggestions are rate-limited to once a week and leave the change to the user.
+
+Daily dashboards and weekly reports bring together recorded minutes, task completions, goal days, and streaks. Subject and tag breakdowns, day-by-day activity bars, hourly focus patterns, and user-provided ratings offer different ways to review study habits. Tag reports include selectable time ranges.
+
+## Progression and shared incentives
+
+### An economy connected to study activity
+
+Study time earns tiered XP with duration milestone bonuses. Levels lead into prestige progression with perks. Study points support personal reward shops and purchases, while conversion into boss coins introduces a separate currency with caps and expiring overflow.
+
+Inventory and timed potions affect the reward pipeline. Potion bonuses are weighted by their overlap with the session, with a cap on the effective multiplier. Bounty XP also uses the overlap between the session and the activated bonus window. Shared calculation helpers keep those bonus rules available to both study and Pomodoro paths.
+
+Longer sessions can produce weighted loot drops. The economy also includes tiered gacha outcomes, conversion tracking, and transaction history. A minimum recorded session duration gates study rewards to reduce rewards from trivial timer starts.
+
+### Quests, raids, and seasons
+
+Daily quests draw from difficulty-tiered pools and track study events alongside planning and social activity. Badge categories cover persistence, group participation, raid contributions, review activity, and economy milestones. Profiles can display featured badges.
+
+Recorded study time contributes damage to a shared raid boss. Beacons provide temporary channel-based incentives, and bounties let one user sponsor another's study session. Expired unused bounties have a refund path. Raid resolution handles participation and podium rewards, and the next boss's HP is calculated from damage dealt and whether the previous boss was defeated.
+
+Seasonal ranks and archived results provide progression beyond individual sessions. Leaderboards cover different activity metrics, while the configurable private `/duo` board offers a smaller comparison group. Cheers and a current-studying view support encouragement without requiring everyone to join a group timer.
+
+### Personal rewards and notification choices
+
+Personal reward shops let users define what their points can buy. Temptation bundling provides another option: a chosen treat label and optional link are sent after a completed Pomodoro work block, at the start of a break, or after a study session meets a configured duration. This is a reward-message workflow, not application blocking.
+
+Productivity-only accounts keep access to focus and planning tools without the RPG systems. Settings offer notification-category controls, ghost mode, and a choice to block cheers. Server allowlisting and separate DM/RPG interaction gates define where different workflows are available.
+
+`/export` packages study sessions, tasks, point transactions, reward redemptions, check-ins, badges, and gacha history into CSV files inside a ZIP. The deployment owner can also create database backups and inspect operational status.
+
+## Engineering and recovery
+
+The bot coordinates persistent records, scheduled jobs, and asynchronous Discord interactions:
+
+- **State and accounting:** SQLite schema migrations, write-ahead logging, foreign keys, and configurable lock timeouts support the shared persistence layer. Per-user asynchronous locks coordinate selected session, task, and Pomodoro operations.
+- **Repeat-safe operations:** guarded database updates cover operations such as claiming a raid's end, consuming a bounty, and issuing expired-bounty refunds. Regression tests exercise repeated calls to these paths.
+- **Durable notifications:** the SQLite outbox stores delivery state and deduplication keys. Its worker claims batches, retries delivery, recovers stale sending records, and checks relevant notification settings. Discord delivery and database commits remain separate operations, so this does not guarantee exactly-once delivery.
+- **Scheduled recovery:** startup reloads pending reminders and timer state. A bounded schedule catch-up path handles recently missed study blocks, while reconnect handling avoids rerunning the full startup catch-up on every connection recovery.
+- **Process supervision:** a gateway watchdog detects stalled connection attempts and prolonged disconnects. The reconnect loop backs off and can exit after repeated identical failures so an external supervisor can restart it. Windows watchdog and NSSM installation scripts are included.
+- **Operational controls:** owner-only diagnostics cover database health, scheduler state, usage, and configured channels. Graceful shutdown includes a SQLite WAL checkpoint.
+
+The automated checks include database/outbox behavior, study segments, reward calculations, group start votes, schedule reminder settings, bounty use and refunds, and raid-end claims. Structural smoke checks also inspect startup contracts, extension loading, notification wiring, and schema requirements.
 
 ## Setup
 
@@ -64,9 +119,15 @@ For supported commands in DMs, set `SYNC_COMMANDS=true` for a boot to register g
 .\venv\Scripts\python.exe bot.py
 ```
 
-Open `/tutorial` for the detailed guide or `/help` for commands. Common starting points are `/study start`, `/pomodoro start`, `/group start`, `/task add`, `/schedule add`, and `/today`. `/source` provides the configured source link and license.
+Open `/tutorial` for the detailed guide or `/help` for commands. Common starting points are `/study start`, `/pomodoro start`, `/group_pomo start`, `/task add`, `/schedule add`, and `/today`. `/source` provides the configured source link and license.
 
 GitHub hosts the code. You still need a computer or server running the bot and a Discord application of your own.
+
+## Current scope and verification
+
+StudyBot is under development. The publication checks passed **53 tests**, the structural smoke check, a small database simulation, and an offline startup that loaded all 20 feature modules. Those checks did not exercise a live Discord deployment.
+
+Recorded time and focus ratings are user-reported signals. Adaptive goal suggestions are rule-based, and no AI service is required. The bot is self-hosted: the operator controls its database and credentials, and Discord carries the messages and interactions.
 
 ## Development checks
 
