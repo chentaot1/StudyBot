@@ -29,15 +29,15 @@ class Social(commands.Cog):
             await interaction.response.send_message("You can't cheer yourself! (But we appreciate the energy.)", ephemeral=True)
             return
 
-        self.bot.db.ensure_user(uid, interaction.user.display_name)
-        self.bot.db.ensure_user(target.id, target.display_name)
+        (await self.bot.db_worker.run(lambda: self.bot.db.ensure_user(uid, interaction.user.display_name)))
+        (await self.bot.db_worker.run(lambda: self.bot.db.ensure_user(target.id, target.display_name)))
 
-        target_data = self.bot.db.get_user(target.id)
+        target_data = (await self.bot.db_worker.run(lambda: self.bot.db.get_user(target.id)))
         if target_data and (target_data.get("ghost_mode") or target_data.get("block_cheers")):
             await interaction.response.send_message("That user has blocked cheers.", ephemeral=True)
             return
 
-        ok = self.bot.db.send_cheer(uid, target.id)
+        ok = (await self.bot.db_worker.run(lambda: self.bot.db.send_cheer(uid, target.id)))
         if not ok:
             await interaction.response.send_message(
                 "You've already cheered that person **today (EST)**. Try again tomorrow!",
@@ -60,9 +60,9 @@ class Social(commands.Cog):
         if badge_cog:
             await badge_cog.check_social_badges(uid)
 
-        if self.bot.db.get_dm_enabled(target.id, "cheer_received"):
+        if (await self.bot.db_worker.run(lambda: self.bot.db.get_dm_enabled(target.id, "cheer_received"))):
             today_est = datetime.now(EST).date().isoformat()
-            self.bot.db.enqueue_outbox(
+            (await self.bot.db_worker.run(lambda: self.bot.db.enqueue_outbox(
                 target_type="user",
                 target_id=int(target.id),
                 kind="cheer_received",
@@ -73,7 +73,7 @@ class Social(commands.Cog):
                     "description": f"**{interaction.user.display_name}** is cheering you on! Keep studying!",
                     "color": int(COLOR_SUCCESS),
                 },
-            )
+            )))
 
     @app_commands.command(name="who", description="See who's currently studying")
     @app_commands.checks.cooldown(1, 5.0)
@@ -82,13 +82,13 @@ class Social(commands.Cog):
             await interaction.response.send_message("Lite mode: social/RPG features are disabled for your account.", ephemeral=True)
             return
         await interaction.response.defer(ephemeral=True)
-        sessions = self.bot.db.get_all_active_sessions()
+        sessions = (await self.bot.db_worker.run(lambda: self.bot.db.get_all_active_sessions()))
         if not sessions:
             await interaction.followup.send("Nobody is studying right now. Be the first! 📚", ephemeral=True)
             return
 
         user_ids = [s["user_id"] for s in sessions]
-        users_batch = self.bot.db.get_users_batch(user_ids)
+        users_batch = (await self.bot.db_worker.run(lambda: self.bot.db.get_users_batch(user_ids)))
 
         now = datetime.now(timezone.utc).replace(tzinfo=None)
         lines = []

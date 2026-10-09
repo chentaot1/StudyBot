@@ -24,8 +24,8 @@ class Projects(commands.Cog):
     async def _autocomplete_project_id(
         self, interaction: discord.Interaction, current: str
     ) -> list[app_commands.Choice[int]]:
-        self.bot.db.ensure_user(interaction.user.id, str(interaction.user))
-        projects = self.bot.db.get_projects(interaction.user.id)
+        (await self.bot.db_worker.run(lambda: self.bot.db.ensure_user(interaction.user.id, str(interaction.user))))
+        projects = (await self.bot.db_worker.run(lambda: self.bot.db.get_projects(interaction.user.id)))
         today = datetime.now(EST).date()
         choices = []
         for p in projects:
@@ -53,7 +53,7 @@ class Projects(commands.Cog):
         due_date: str = "",
         description: str = ""
     ):
-        self.bot.db.ensure_user(interaction.user.id, str(interaction.user))
+        (await self.bot.db_worker.run(lambda: self.bot.db.ensure_user(interaction.user.id, str(interaction.user))))
 
         parsed_due = None
         if due_date:
@@ -65,7 +65,7 @@ class Projects(commands.Cog):
                 )
                 return
 
-        pid = self.bot.db.add_project(interaction.user.id, name, description, parsed_due)
+        pid = (await self.bot.db_worker.run(lambda: self.bot.db.add_project(interaction.user.id, name, description, parsed_due)))
 
         embed = discord.Embed(title="📁 Project Created!", color=COLOR_PRIMARY)
         embed.add_field(name="Name", value=name, inline=True)
@@ -87,8 +87,8 @@ class Projects(commands.Cog):
 
     @project.command(name="list", description="View all your active projects")
     async def project_list(self, interaction: discord.Interaction):
-        self.bot.db.ensure_user(interaction.user.id, str(interaction.user))
-        projects = self.bot.db.get_projects(interaction.user.id)
+        (await self.bot.db_worker.run(lambda: self.bot.db.ensure_user(interaction.user.id, str(interaction.user))))
+        projects = (await self.bot.db_worker.run(lambda: self.bot.db.get_projects(interaction.user.id)))
 
         if not projects:
             await interaction.response.send_message("📭 No projects yet. Create one with `/project add`!", ephemeral=True)
@@ -98,7 +98,7 @@ class Projects(commands.Cog):
         today = datetime.now(EST).date()
 
         for p in projects:
-            stats = self.bot.db.get_project_task_stats(p["id"])
+            stats = (await self.bot.db_worker.run(lambda: self.bot.db.get_project_task_stats(p["id"])))
             pct = int(stats["done"] / stats["total"] * 100) if stats["total"] else 0
             bar_filled = pct // 10
             bar = "█" * bar_filled + "░" * (10 - bar_filled)
@@ -146,14 +146,14 @@ class Projects(commands.Cog):
     @project.command(name="view", description="View a project's details and tasks")
     @app_commands.describe(project_id="Project ID from /project list")
     async def project_view(self, interaction: discord.Interaction, project_id: int):
-        self.bot.db.ensure_user(interaction.user.id, str(interaction.user))
-        project = self.bot.db.get_project(project_id, interaction.user.id)
+        (await self.bot.db_worker.run(lambda: self.bot.db.ensure_user(interaction.user.id, str(interaction.user))))
+        project = (await self.bot.db_worker.run(lambda: self.bot.db.get_project(project_id, interaction.user.id)))
         if not project:
             await interaction.response.send_message(f"❌ Project `#{project_id}` not found.", ephemeral=True)
             return
 
-        stats = self.bot.db.get_project_task_stats(project_id)
-        tasks = self.bot.db.get_user_tasks(interaction.user.id, include_done=True, project_id=project_id)
+        stats = (await self.bot.db_worker.run(lambda: self.bot.db.get_project_task_stats(project_id)))
+        tasks = (await self.bot.db_worker.run(lambda: self.bot.db.get_user_tasks(interaction.user.id, include_done=True, project_id=project_id)))
         today = datetime.now(EST).date()
 
         embed = discord.Embed(title=f"📁 {project['name']}", color=COLOR_PRIMARY)
@@ -225,11 +225,11 @@ class Projects(commands.Cog):
     @project.command(name="done", description="Mark a project as complete")
     @app_commands.describe(project_id="Project ID to complete")
     async def project_done(self, interaction: discord.Interaction, project_id: int):
-        project = self.bot.db.get_project(project_id, interaction.user.id)
+        project = (await self.bot.db_worker.run(lambda: self.bot.db.get_project(project_id, interaction.user.id)))
         if not project:
             await interaction.response.send_message(f"❌ Project `#{project_id}` not found.", ephemeral=True)
             return
-        self.bot.db.complete_project(project_id, interaction.user.id)
+        (await self.bot.db_worker.run(lambda: self.bot.db.complete_project(project_id, interaction.user.id)))
         embed = discord.Embed(
             title="🎉 Project Complete!",
             description=f"**{project['name']}** is done! Great work.",
@@ -248,7 +248,7 @@ class Projects(commands.Cog):
     @project.command(name="delete", description="Delete a project (tasks are NOT deleted)")
     @app_commands.describe(project_id="Project ID to delete")
     async def project_delete(self, interaction: discord.Interaction, project_id: int):
-        project = self.bot.db.get_project(project_id, interaction.user.id)
+        project = (await self.bot.db_worker.run(lambda: self.bot.db.get_project(project_id, interaction.user.id)))
         if not project:
             await interaction.response.send_message(f"❌ Project `#{project_id}` not found.", ephemeral=True)
             return
@@ -284,7 +284,7 @@ class ConfirmDeleteView(discord.ui.View):
 
     @discord.ui.button(label="Delete", style=discord.ButtonStyle.danger)
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.bot.db.delete_project(self.project_id, self.user_id)
+        (await self.bot.db_worker.run(lambda: self.bot.db.delete_project(self.project_id, self.user_id)))
         await interaction.response.edit_message(content=f"🗑️ Project **{self.name}** deleted.", view=None)
         self.stop()
 

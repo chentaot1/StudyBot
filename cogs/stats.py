@@ -104,7 +104,7 @@ class Stats(commands.Cog):
         days: int | None,
         edit: bool,
     ):
-        self.bot.db.ensure_user(user_id, str(interaction.user))
+        (await self.bot.db_worker.run(lambda: self.bot.db.ensure_user(user_id, str(interaction.user))))
         now_est = datetime.now(EST)
 
         label = "30 Days"
@@ -126,7 +126,7 @@ class Stats(commands.Cog):
             label = f"{days} Days"
             eff_days = days
 
-        tags = self.bot.db.get_tag_stats(user_id, days=eff_days)
+        tags = (await self.bot.db_worker.run(lambda: self.bot.db.get_tag_stats(user_id, days=eff_days)))
         if not tags:
             embed = discord.Embed(title=f"🏷️ Tag Breakdown ({label})", color=0x5865F2)
             embed.description = "_No tagged sessions in this range._"
@@ -166,23 +166,23 @@ class Stats(commands.Cog):
     )
     async def stats(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
-        self.bot.db.ensure_user(interaction.user.id, str(interaction.user))
+        (await self.bot.db_worker.run(lambda: self.bot.db.ensure_user(interaction.user.id, str(interaction.user))))
 
         # LAZY EVALUATION: Check adaptive goal logic every time stats are viewed!
         await self.bot._check_adaptive_goal(interaction.user.id)
         is_lite = getattr(self.bot, "is_lite_user", lambda _uid: False)(interaction.user.id)
 
-        user = self.bot.db.get_user(interaction.user.id)
-        total_mins = self.bot.db.get_total_study_minutes(interaction.user.id)
-        weekly_mins = self.bot.db.get_weekly_study_minutes(interaction.user.id)
-        sessions = self.bot.db.get_user_sessions(interaction.user.id, limit=100)
-        all_tasks = self.bot.db.get_user_tasks(interaction.user.id, include_done=True)
+        user = (await self.bot.db_worker.run(lambda: self.bot.db.get_user(interaction.user.id)))
+        total_mins = (await self.bot.db_worker.run(lambda: self.bot.db.get_total_study_minutes(interaction.user.id)))
+        weekly_mins = (await self.bot.db_worker.run(lambda: self.bot.db.get_weekly_study_minutes(interaction.user.id)))
+        sessions = (await self.bot.db_worker.run(lambda: self.bot.db.get_user_sessions(interaction.user.id, limit=100)))
+        all_tasks = (await self.bot.db_worker.run(lambda: self.bot.db.get_user_tasks(interaction.user.id, include_done=True)))
         done_tasks = [t for t in all_tasks if t["completed"]]
         pending_tasks = [t for t in all_tasks if not t["completed"]]
-        rewards = self.bot.db.get_rewards(interaction.user.id)
-        redemptions = self.bot.db.get_redemption_history(interaction.user.id, limit=100)
-        avg_rating = self.bot.db.get_average_focus_rating(interaction.user.id)
-        projects = self.bot.db.get_projects(interaction.user.id)
+        rewards = (await self.bot.db_worker.run(lambda: self.bot.db.get_rewards(interaction.user.id)))
+        redemptions = (await self.bot.db_worker.run(lambda: self.bot.db.get_redemption_history(interaction.user.id, limit=100)))
+        avg_rating = (await self.bot.db_worker.run(lambda: self.bot.db.get_average_focus_rating(interaction.user.id)))
+        projects = (await self.bot.db_worker.run(lambda: self.bot.db.get_projects(interaction.user.id)))
 
         from database import xp_for_level, MAX_LEVEL, seasonal_rank_for_minutes
         rpg_level = user.get("level", 1)
@@ -256,10 +256,10 @@ class Stats(commands.Cog):
         pts_spent = sum(r["cost"] for r in redemptions)
         embed.add_field(name="🏪 Rewards", value=f"{len(rewards)} in shop · {len(redemptions)} redeemed · {pts_spent} pts spent", inline=False)
 
-        goal = self.bot.db.get_today_goal(interaction.user.id)
+        goal = (await self.bot.db_worker.run(lambda: self.bot.db.get_today_goal(interaction.user.id)))
         # DERIVED STATE TRUTH: Pull the real today's minutes
         today_iso = datetime.now(EST).date().isoformat()
-        today_mins = self.bot.db.get_study_minutes_on_date(interaction.user.id, today_iso)
+        today_mins = (await self.bot.db_worker.run(lambda: self.bot.db.get_study_minutes_on_date(interaction.user.id, today_iso)))
 
         if goal > 0:
             pct = min(int(today_mins / goal * 100), 100)
@@ -281,101 +281,15 @@ class Stats(commands.Cog):
 
     @app_commands.command(
         name="today",
-        description="Daily snapshot: streak, goal, potions, raid — same info as /stats in one screen",
+        description="Today: goals, tasks, reviews, next block and quick study controls",
     )
     async def today_cmd(self, interaction: discord.Interaction):
+        from views.today import build_dashboard
         await interaction.response.defer(ephemeral=True)
         uid = interaction.user.id
-        self.bot.db.ensure_user(uid, str(interaction.user))
+        await self.bot.db_worker.run(self.bot.db.ensure_user, uid, str(interaction.user))
         await self.bot._check_adaptive_goal(uid)
-        is_lite = getattr(self.bot, "is_lite_user", lambda _uid: False)(uid)
-
-        user = self.bot.db.get_user(uid)
-        if not user:
-            await interaction.followup.send("Could not load your profile.", ephemeral=True)
-            return
-
-        today_iso = datetime.now(EST).date().isoformat()
-        today_mins = self.bot.db.get_study_minutes_on_date(uid, today_iso)
-        goal = self.bot.db.get_today_goal(uid)
-
-        embed = discord.Embed(title="📌 Today", color=COLOR_PRIMARY)
-        embed.set_author(name=str(interaction.user), icon_url=interaction.user.display_avatar.url)
-
-        s = user["streak"]
-        embed.add_field(name="🔥 Streak", value=f"{s}d ({streak_tier(s)})", inline=True)
-        embed.add_field(name="💎 Points", value=f"{user['points']:,}", inline=True)
-        if not is_lite:
-            embed.add_field(name="🪙 Coins", value=str(user.get("coins", 0)), inline=True)
-
-        if goal > 0:
-            pct = min(int(today_mins / goal * 100), 100)
-            bar = make_bar(today_mins, goal, 14)
-            embed.add_field(
-                name="🎯 Today's goal",
-                value=f"`{bar}` {pct}% · {fmt_mins(today_mins)}/{fmt_mins(goal)}",
-                inline=False,
-            )
-        else:
-            embed.add_field(name="🎯 Today's goal", value="Not set — use `/goals set`", inline=False)
-
-        potions = self.bot.db.get_active_potions(uid)
-        if potions:
-            now = datetime.now(timezone.utc).replace(tzinfo=None)
-            lines = []
-            for p in potions:
-                expires = parse_stored(p["expires_at"])
-                remaining = max((expires - now).total_seconds() / 60, 0)
-                lines.append(f"**{p['effect_type']}** {p['multiplier']}x · {fmt_mins(int(remaining))} left")
-            embed.add_field(name="🧪 Potions", value="\n".join(lines[:8]), inline=False)
-        else:
-            embed.add_field(name="🧪 Potions", value="_None active_", inline=False)
-
-        overflow = self.bot.db.get_overflow(uid)
-        if overflow and not is_lite:
-            total_ov = sum(o["amount"] for o in overflow)
-            embed.add_field(
-                name="📬 Coin overflow",
-                value=f"**{total_ov}** pending — open `/inventory`",
-                inline=False,
-            )
-
-        session = self.bot.db.get_active_session(uid)
-        if session:
-            from cogs.study import get_elapsed_and_paused
-
-            active_secs, _ = get_elapsed_and_paused(session)
-            subj = session.get("subject") or "General"
-            paused = " (paused)" if session.get("is_paused") else ""
-            embed.add_field(
-                name="📚 Active session",
-                value=f"**{subj}**{paused} · {fmt_mins(active_secs // 60)} active",
-                inline=False,
-            )
-
-        if not is_lite:
-            boss = self.bot.db.get_active_boss()
-            if boss and boss.get("hp_remaining", 0) > 0:
-                hp = boss["hp"]
-                rem = boss["hp_remaining"]
-                embed.add_field(
-                    name="⚔️ Raid boss",
-                    value=f"**{rem:,}** / {hp:,} HP left — `/raid`",
-                    inline=False,
-                )
-            else:
-                embed.add_field(name="⚔️ Raid boss", value="_No active boss_", inline=False)
-
-        sched_blocks = self.bot.db.get_user_schedule(uid)
-        if sched_blocks and not self.bot.db.get_dm_enabled(uid, "schedule_reminders"):
-            embed.add_field(
-                name="📅 Schedule DMs",
-                value="You have `/schedule` blocks but **Schedule Reminders** are off — turn them on in `/settings` to get start-time DMs.",
-                inline=False,
-            )
-
-        embed.set_footer(text=USER_NAV_FOOTER)
-        await interaction.followup.send(embed=embed, ephemeral=True)
+        await interaction.followup.send(view=await build_dashboard(self.bot, interaction), ephemeral=True)
 
     breakdown = app_commands.Group(
         name="breakdown",
@@ -384,8 +298,8 @@ class Stats(commands.Cog):
 
     @breakdown.command(name="subjects", description="Time per subject (last 30 days)")
     async def breakdown_subjects(self, interaction: discord.Interaction):
-        self.bot.db.ensure_user(interaction.user.id, str(interaction.user))
-        subjects = self.bot.db.get_subject_stats(interaction.user.id, days=30)
+        (await self.bot.db_worker.run(lambda: self.bot.db.ensure_user(interaction.user.id, str(interaction.user))))
+        subjects = (await self.bot.db_worker.run(lambda: self.bot.db.get_subject_stats(interaction.user.id, days=30)))
         if not subjects:
             await interaction.response.send_message("No sessions in the last 30 days.", ephemeral=True)
             return
@@ -444,16 +358,16 @@ class Stats(commands.Cog):
 
     @breakdown.command(name="week", description="Day-by-day study activity this week")
     async def breakdown_week(self, interaction: discord.Interaction):
-        self.bot.db.ensure_user(interaction.user.id, str(interaction.user))
-        daily = self.bot.db.get_daily_breakdown(interaction.user.id, days=7)
-        user_data = self.bot.db.get_user(interaction.user.id)
+        (await self.bot.db_worker.run(lambda: self.bot.db.ensure_user(interaction.user.id, str(interaction.user))))
+        daily = (await self.bot.db_worker.run(lambda: self.bot.db.get_daily_breakdown(interaction.user.id, days=7)))
+        user_data = (await self.bot.db_worker.run(lambda: self.bot.db.get_user(interaction.user.id)))
         default_goal = user_data["daily_goal_minutes"] if user_data else 60
         day_map = {d["date"]: d["minutes"] for d in daily}
         today = datetime.now(EST).date()
         days = [(today - timedelta(days=6-i)) for i in range(7)]
         total = sum(day_map.get(d.isoformat(), 0) for d in days)
         max_mins = max((day_map.get(d.isoformat(), 0) for d in days), default=1) or 1
-        goal_hits = self.bot.db.get_goal_hit_streak(interaction.user.id, days=7)
+        goal_hits = (await self.bot.db_worker.run(lambda: self.bot.db.get_goal_hit_streak(interaction.user.id, days=7)))
         lines = []
         days_hit = 0
         for i, d in enumerate(days):
@@ -485,8 +399,8 @@ class Stats(commands.Cog):
 
     @breakdown.command(name="focus", description="Peak focus hours, quality trends, best time to study")
     async def breakdown_focus(self, interaction: discord.Interaction):
-        self.bot.db.ensure_user(interaction.user.id, str(interaction.user))
-        hourly = self.bot.db.get_hourly_stats(interaction.user.id, days=30)
+        (await self.bot.db_worker.run(lambda: self.bot.db.ensure_user(interaction.user.id, str(interaction.user))))
+        hourly = (await self.bot.db_worker.run(lambda: self.bot.db.get_hourly_stats(interaction.user.id, days=30)))
 
         if not hourly:
             await interaction.response.send_message("Not enough data yet — study more sessions first!", ephemeral=True)

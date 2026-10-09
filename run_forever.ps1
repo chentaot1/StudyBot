@@ -11,12 +11,16 @@ if (-not $PSScriptRoot) {
 }
 $Root = $PSScriptRoot
 
-$Py = Join-Path $Root "venv\Scripts\python.exe"
-if (-not (Test-Path $Py)) {
-    $Py = Join-Path $Root ".venv\Scripts\python.exe"
+$Py = $null
+foreach ($studyPythonCandidate in @((Join-Path $Root ".venv\Scripts\python.exe"), (Join-Path $Root "venv\Scripts\python.exe"))) {
+    if (Test-Path -LiteralPath $studyPythonCandidate) {
+        & $studyPythonCandidate -c "import discord, apscheduler, dotenv; print('Python environment OK: discord.py ' + discord.__version__)"
+        if ($LASTEXITCODE -eq 0) { $Py = $studyPythonCandidate; break }
+    }
 }
-if (-not (Test-Path $Py)) {
-    $Py = "python"
+if (-not $Py) {
+    Write-Error "No working StudyBot environment. Run .\setup.ps1 first."
+    exit 3
 }
 
 $Bot = Join-Path $Root "bot.py"
@@ -37,11 +41,13 @@ Write-Host "StudyBot watchdog — Python: $Py — Root: $Root"
 
 while ($true) {
     $ts = Get-Date -Format "o"
+    $studyRunStarted = Get-Date
     Add-Content -Path $WatchLog -Value "[$ts] starting: $Py $Bot"
 
     # Append stdout+stderr for this run (CMD redirection is simplest on Windows PowerShell)
     cmd /c "`"$Py`" `"$Bot`" >> `"$RunLog`" 2>&1"
     $code = $LASTEXITCODE
+    if (((Get-Date) - $studyRunStarted).TotalSeconds -ge 300) { $BackoffSec = 5 }
 
     $ts2 = Get-Date -Format "o"
     Add-Content -Path $WatchLog -Value "[$ts2] exited code=$code — sleeping ${BackoffSec}s"

@@ -44,12 +44,15 @@ if (-not $nssm) {
 
 $Root = $PSScriptRoot
 
-$Py = Join-Path $Root "venv\Scripts\python.exe"
-if (-not (Test-Path $Py)) {
-    $Py = Join-Path $Root ".venv\Scripts\python.exe"
+$Py = $null
+foreach ($studyPythonCandidate in @((Join-Path $Root ".venv\Scripts\python.exe"), (Join-Path $Root "venv\Scripts\python.exe"))) {
+    if (Test-Path -LiteralPath $studyPythonCandidate) {
+        & $studyPythonCandidate -c "import discord, apscheduler, dotenv; print('Python environment OK: discord.py ' + discord.__version__)"
+        if ($LASTEXITCODE -eq 0) { $Py = $studyPythonCandidate; break }
+    }
 }
-if (-not (Test-Path $Py)) {
-    Write-Error "Python not found at venv\Scripts\python.exe — create a venv in $Root first."
+if (-not $Py) {
+    Write-Error "No working Python environment. Run .\setup.ps1 first."
     exit 3
 }
 

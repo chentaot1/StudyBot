@@ -14,6 +14,7 @@ from constants import (
     COLOR_PRIMARY, COLOR_SUCCESS, COLOR_WARNING, USER_NAV_FOOTER,
 )
 from utils import fmt_mins, parse_stored, utcnow_naive
+from views.persistent import bind_buttons
 
 log = logging.getLogger("StudyBot.Pomodoro")
 
@@ -38,7 +39,7 @@ class PomodoroSoloView(discord.ui.View):
         self.cog = cog
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        pomo = self.cog.bot.db.get_active_pomodoro(interaction.user.id)
+        pomo = (await self.cog.bot.db_worker.run(lambda: self.cog.bot.db.get_active_pomodoro(interaction.user.id)))
         if not pomo:
             await interaction.response.send_message(
                 "You don't have an active Pomodoro. Use `/pomodoro start`.", ephemeral=True
@@ -48,20 +49,20 @@ class PomodoroSoloView(discord.ui.View):
 
     @discord.ui.button(label="Status", style=discord.ButtonStyle.secondary, emoji="📊", row=0)
     async def status_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        pomo = self.cog.bot.db.get_active_pomodoro(interaction.user.id)
+        pomo = (await self.cog.bot.db_worker.run(lambda: self.cog.bot.db.get_active_pomodoro(interaction.user.id)))
         await interaction.response.send_message(embed=build_pomo_embed(pomo), ephemeral=True)
 
     @discord.ui.button(label="Skip phase", style=discord.ButtonStyle.primary, emoji="⏭️", row=0)
     async def skip_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         uid = interaction.user.id
-        pomo = self.cog.bot.db.get_active_pomodoro(uid)
+        pomo = (await self.cog.bot.db_worker.run(lambda: self.cog.bot.db.get_active_pomodoro(uid)))
         if not pomo:
             await interaction.response.send_message("❌ No active Pomodoro.", ephemeral=True)
             return
         self.cog._cancel_pomo_task(uid)
         await interaction.response.defer(ephemeral=True)
         await self.cog._transition_phase(uid, pomo, auto=False)
-        new_pomo = self.cog.bot.db.get_active_pomodoro(uid)
+        new_pomo = (await self.cog.bot.db_worker.run(lambda: self.cog.bot.db.get_active_pomodoro(uid)))
         embed = discord.Embed(title="⏭️ Phase Skipped!", color=0x5865F2)
         if new_pomo:
             phase_map = {"work": "🔴 Focus", "break": "☕ Break", "long_break": "🏖️ Long Break"}
@@ -80,14 +81,22 @@ class GroupLobbyWaitingView(discord.ui.View):
         super().__init__(timeout=None)
         self.cog = cog
         self.lobby_id = lobby_id
+        bind_buttons(self, f"sb:group:{lobby_id}:waiting")
+
+    async def interaction_check(self, interaction):
+        lobby = await self.cog.bot.db_worker.run(self.cog.bot.db.get_group_lobby_by_id, self.lobby_id)
+        if not lobby or lobby.get("state") != "waiting" or lobby.get("source_guild_id") != interaction.guild_id:
+            await interaction.response.send_message("This lobby card is no longer available here. Use /group_pomo status.", ephemeral=True)
+            return False
+        return await self.cog.bot.tree.interaction_check(interaction)
 
     @discord.ui.button(label="Begin session", style=discord.ButtonStyle.success, emoji="▶️", row=0)
     async def begin_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        ug = self.cog.bot.db.get_user_group_lobby(interaction.user.id)
+        ug = (await self.cog.bot.db_worker.run(lambda: self.cog.bot.db.get_user_group_lobby(interaction.user.id)))
         if not ug or ug["id"] != self.lobby_id:
             await interaction.response.send_message("You're not in this lobby.", ephemeral=True)
             return
-        lobby = self.cog.bot.db.get_group_lobby_by_id(self.lobby_id)
+        lobby = (await self.cog.bot.db_worker.run(lambda: self.cog.bot.db.get_group_lobby_by_id(self.lobby_id)))
         if not lobby or lobby["state"] != "waiting":
             await interaction.response.send_message(
                 "This lobby can't be started from here anymore.", ephemeral=True
@@ -101,25 +110,25 @@ class GroupLobbyWaitingView(discord.ui.View):
     @discord.ui.button(label="Leave lobby", style=discord.ButtonStyle.secondary, emoji="🚪", row=0)
     async def leave_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         uid = interaction.user.id
-        ug = self.cog.bot.db.get_user_group_lobby(uid)
+        ug = (await self.cog.bot.db_worker.run(lambda: self.cog.bot.db.get_user_group_lobby(uid)))
         if not ug or ug["id"] != self.lobby_id:
             await interaction.response.send_message("You're not in this lobby.", ephemeral=True)
             return
         session = None
         async with self.cog.bot.user_locks[uid]:
-            self.cog.bot.db.leave_group_lobby(uid)
+            (await self.cog.bot.db_worker.run(lambda: self.cog.bot.db.leave_group_lobby(uid)))
             study_cog = self.cog.bot.cogs.get("Study")
             if study_cog:
                 study_cog._cancel_live_task(uid)
                 study_cog._cancel_motivation_task(uid)
                 study_cog._cancel_inactivity_monitor(uid)
                 study_cog._session_panel_views.pop(uid, None)
-            session = self.cog.bot.db.end_session(uid)
+            session = (await self.cog.bot.db_worker.run(lambda: self.cog.bot.db.end_session(uid)))
             if session and session["duration_minutes"] >= 5 and study_cog:
                 await study_cog._process_session_rewards(uid, session)
 
         note = _group_leave_reward_note(session)
-        lobby_now = self.cog.bot.db.get_group_lobby_by_id(self.lobby_id)
+        lobby_now = (await self.cog.bot.db_worker.run(lambda: self.cog.bot.db.get_group_lobby_by_id(self.lobby_id)))
         if not lobby_now or lobby_now["state"] == "completed":
             await interaction.response.edit_message(
                 embed=discord.Embed(
@@ -140,14 +149,14 @@ class GroupLobbyWaitingView(discord.ui.View):
                 view=None,
             )
             return
-        embed = self.cog._waiting_lobby_embed(lobby_now)
+        embed = (await self.cog._waiting_lobby_embed(lobby_now))
         if note.strip():
             embed.add_field(name="Your study", value=note.strip(), inline=False)
         await interaction.response.edit_message(embed=embed, view=GroupLobbyWaitingView(self.cog, self.lobby_id))
 
     @discord.ui.button(label="Refresh", style=discord.ButtonStyle.secondary, emoji="🔄", row=0)
     async def refresh_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        lobby_now = self.cog.bot.db.get_group_lobby_by_id(self.lobby_id)
+        lobby_now = (await self.cog.bot.db_worker.run(lambda: self.cog.bot.db.get_group_lobby_by_id(self.lobby_id)))
         if not lobby_now or lobby_now["state"] == "completed":
             await interaction.response.edit_message(
                 embed=discord.Embed(title="🍅 Lobby closed", description="This lobby no longer exists.", color=0x747F8D),
@@ -164,13 +173,13 @@ class GroupLobbyWaitingView(discord.ui.View):
                 view=None,
             )
             return
-        embed = self.cog._waiting_lobby_embed(lobby_now)
+        embed = (await self.cog._waiting_lobby_embed(lobby_now))
         await interaction.response.edit_message(embed=embed, view=GroupLobbyWaitingView(self.cog, self.lobby_id))
 
     @discord.ui.button(label="Join this lobby", style=discord.ButtonStyle.primary, emoji="➕", row=1)
     async def join_public_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         uid = interaction.user.id
-        lobby = self.cog.bot.db.get_group_lobby_by_id(self.lobby_id)
+        lobby = (await self.cog.bot.db_worker.run(lambda: self.cog.bot.db.get_group_lobby_by_id(self.lobby_id)))
         if not lobby or lobby["state"] != "waiting":
             await interaction.response.send_message(
                 "This lobby isn't accepting joins anymore.", ephemeral=True
@@ -178,7 +187,7 @@ class GroupLobbyWaitingView(discord.ui.View):
             return
         code = lobby["code"]
 
-        already = self.cog.bot.db.get_user_group_lobby(uid)
+        already = (await self.cog.bot.db_worker.run(lambda: self.cog.bot.db.get_user_group_lobby(uid)))
         if already and already["id"] == self.lobby_id:
             await interaction.response.send_message(
                 "You're already in this lobby. When the host is ready, they'll start the session.",
@@ -187,11 +196,11 @@ class GroupLobbyWaitingView(discord.ui.View):
             return
 
         async with self.cog.bot.user_locks[uid]:
-            self.cog.bot.db.ensure_user(uid, str(interaction.user))
+            (await self.cog.bot.db_worker.run(lambda: self.cog.bot.db.ensure_user(uid, str(interaction.user))))
 
             # Users are allowed to study while waiting in the lobby. The host starting the
             # group session will auto-end the personal session and award rewards.
-            ug = self.cog.bot.db.get_user_group_lobby(uid)
+            ug = (await self.cog.bot.db_worker.run(lambda: self.cog.bot.db.get_user_group_lobby(uid)))
             if ug and ug["id"] != self.lobby_id:
                 await interaction.response.send_message(
                     "You're already in a different lobby. Leave it first with `/group_pomo leave`.",
@@ -199,7 +208,7 @@ class GroupLobbyWaitingView(discord.ui.View):
                 )
                 return
 
-            result = self.cog.bot.db.join_group_lobby(code, uid)
+            result = (await self.cog.bot.db_worker.run(lambda: self.cog.bot.db.join_group_lobby(code, uid)))
             if not result:
                 await interaction.response.send_message(
                     "Couldn't join — the lobby may have just closed.", ephemeral=True
@@ -210,11 +219,11 @@ class GroupLobbyWaitingView(discord.ui.View):
                 return
 
         await interaction.response.defer(ephemeral=True)
-        lobby_now = self.cog.bot.db.get_group_lobby_by_id(self.lobby_id)
+        lobby_now = (await self.cog.bot.db_worker.run(lambda: self.cog.bot.db.get_group_lobby_by_id(self.lobby_id)))
         if lobby_now and lobby_now["state"] == "waiting" and interaction.message is not None:
             try:
                 await interaction.message.edit(
-                    embed=self.cog._waiting_lobby_embed(lobby_now),
+                    embed=(await self.cog._waiting_lobby_embed(lobby_now)),
                     view=GroupLobbyWaitingView(self.cog, self.lobby_id),
                 )
             except Exception as e:
@@ -222,7 +231,7 @@ class GroupLobbyWaitingView(discord.ui.View):
         else:
             pass
 
-        members = self.cog.bot.db.get_group_members(result["id"])
+        members = (await self.cog.bot.db_worker.run(lambda: self.cog.bot.db.get_group_members(result["id"])))
         roster = self.cog._group_member_display_lines(members, result["host_id"])
         embed = discord.Embed(
             title="🍅 Joined Group Pomodoro!",
@@ -241,25 +250,25 @@ class GroupLobbyWaitingView(discord.ui.View):
         if not interaction.response.is_done():
             await interaction.response.defer(ephemeral=True)
         uid = interaction.user.id
-        ug = self.cog.bot.db.get_user_group_lobby(uid)
+        ug = (await self.cog.bot.db_worker.run(lambda: self.cog.bot.db.get_user_group_lobby(uid)))
         if not ug or ug["id"] != self.lobby_id:
             await interaction.followup.send("You're not in this lobby.", ephemeral=True)
             return
-        lobby = self.cog.bot.db.get_group_lobby_by_id(self.lobby_id)
+        lobby = (await self.cog.bot.db_worker.run(lambda: self.cog.bot.db.get_group_lobby_by_id(self.lobby_id)))
         if not lobby or lobby["state"] != "waiting":
             await interaction.followup.send("This lobby can't be voted on anymore.", ephemeral=True)
             return
 
-        self.cog.bot.db.vote_start_group_lobby(self.lobby_id, uid)
+        (await self.cog.bot.db_worker.run(lambda: self.cog.bot.db.vote_start_group_lobby(self.lobby_id, uid)))
 
-        members = self.cog.bot.db.get_group_members(self.lobby_id)
+        members = (await self.cog.bot.db_worker.run(lambda: self.cog.bot.db.get_group_members(self.lobby_id)))
         n = len(members)
-        votes = self.cog.bot.db.get_group_lobby_vote_count(self.lobby_id)
+        votes = (await self.cog.bot.db_worker.run(lambda: self.cog.bot.db.get_group_lobby_vote_count(self.lobby_id)))
         needed = (n // 2) + 1
 
         # Auto-start only if 3+ members and majority voted.
         if n >= 3 and votes >= needed:
-            lobby = self.cog.bot.db.get_group_lobby_by_id(self.lobby_id)
+            lobby = (await self.cog.bot.db_worker.run(lambda: self.cog.bot.db.get_group_lobby_by_id(self.lobby_id)))
             if lobby and lobby["state"] == "waiting":
                 await self.cog._execute_group_begin(interaction, lobby, edit_message=True)
             return
@@ -267,7 +276,7 @@ class GroupLobbyWaitingView(discord.ui.View):
         # Otherwise: update the lobby card to reflect vote count.
         try:
             await interaction.edit_original_response(
-                embed=self.cog._waiting_lobby_embed(lobby),
+                embed=(await self.cog._waiting_lobby_embed(lobby)),
                 view=GroupLobbyWaitingView(self.cog, self.lobby_id),
             )
         except Exception:
@@ -287,10 +296,22 @@ class GroupLobbyActiveView(discord.ui.View):
         super().__init__(timeout=None)
         self.cog = cog
         self.lobby_id = lobby_id
+        bind_buttons(self, f"sb:group:{lobby_id}:active")
+
+    async def interaction_check(self, interaction):
+        lobby = await self.cog.bot.db_worker.run(self.cog.bot.db.get_group_lobby_by_id, self.lobby_id)
+        if not lobby or lobby.get("state") != "active" or lobby.get("source_guild_id") != interaction.guild_id:
+            await interaction.response.send_message("This lobby card has ended or belongs to another server.", ephemeral=True)
+            return False
+        member = await self.cog.bot.db_worker.run(self.cog.bot.db.get_user_group_lobby, interaction.user.id)
+        if not member or member["id"] != self.lobby_id:
+            await interaction.response.send_message("These controls are for lobby participants.", ephemeral=True)
+            return False
+        return await self.cog.bot.tree.interaction_check(interaction)
 
     @discord.ui.button(label="Refresh status", style=discord.ButtonStyle.secondary, emoji="🔄")
     async def refresh_status_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        lobby = self.cog.bot.db.get_group_lobby_by_id(self.lobby_id)
+        lobby = (await self.cog.bot.db_worker.run(lambda: self.cog.bot.db.get_group_lobby_by_id(self.lobby_id)))
         if not lobby or lobby.get("state") != "active":
             await interaction.response.edit_message(
                 embed=discord.Embed(
@@ -302,7 +323,7 @@ class GroupLobbyActiveView(discord.ui.View):
             )
             return
         await interaction.response.edit_message(
-            embed=self.cog._active_lobby_embed(lobby),
+            embed=(await self.cog._active_lobby_embed(lobby)),
             view=GroupLobbyActiveView(self.cog, self.lobby_id),
         )
 
@@ -316,11 +337,11 @@ class GroupJoinedView(discord.ui.View):
         self.lobby_id = lobby_id
         self.code_display = code_display
 
-    def _join_embed(self) -> discord.Embed | None:
-        lobby = self.cog.bot.db.get_group_lobby_by_id(self.lobby_id)
+    async def _join_embed(self) -> discord.Embed | None:
+        lobby = (await self.cog.bot.db_worker.run(lambda: self.cog.bot.db.get_group_lobby_by_id(self.lobby_id)))
         if not lobby or lobby["state"] == "completed":
             return None
-        members = self.cog.bot.db.get_group_members(self.lobby_id)
+        members = (await self.cog.bot.db_worker.run(lambda: self.cog.bot.db.get_group_members(self.lobby_id)))
         roster = self.cog._group_member_display_lines(members, lobby["host_id"])
         embed = discord.Embed(
             title="🍅 Joined Group Pomodoro!",
@@ -335,20 +356,20 @@ class GroupJoinedView(discord.ui.View):
     @discord.ui.button(label="Leave lobby", style=discord.ButtonStyle.danger, emoji="🚪", row=0)
     async def leave_joined(self, interaction: discord.Interaction, button: discord.ui.Button):
         uid = interaction.user.id
-        ug = self.cog.bot.db.get_user_group_lobby(uid)
+        ug = (await self.cog.bot.db_worker.run(lambda: self.cog.bot.db.get_user_group_lobby(uid)))
         if not ug or ug["id"] != self.lobby_id:
             await interaction.response.send_message("You're not in this lobby.", ephemeral=True)
             return
         session = None
         async with self.cog.bot.user_locks[uid]:
-            self.cog.bot.db.leave_group_lobby(uid)
+            (await self.cog.bot.db_worker.run(lambda: self.cog.bot.db.leave_group_lobby(uid)))
             study_cog = self.cog.bot.cogs.get("Study")
             if study_cog:
                 study_cog._cancel_live_task(uid)
                 study_cog._cancel_motivation_task(uid)
                 study_cog._cancel_inactivity_monitor(uid)
                 study_cog._session_panel_views.pop(uid, None)
-            session = self.cog.bot.db.end_session(uid)
+            session = (await self.cog.bot.db_worker.run(lambda: self.cog.bot.db.end_session(uid)))
             if session and session["duration_minutes"] >= 5 and study_cog:
                 await study_cog._process_session_rewards(uid, session)
         note = _group_leave_reward_note(session)
@@ -363,7 +384,7 @@ class GroupJoinedView(discord.ui.View):
 
     @discord.ui.button(label="Refresh roster", style=discord.ButtonStyle.secondary, emoji="🔄", row=0)
     async def refresh_joined(self, interaction: discord.Interaction, button: discord.ui.Button):
-        embed = self._join_embed()
+        embed = (await self._join_embed())
         if not embed:
             await interaction.response.edit_message(
                 embed=discord.Embed(title="Lobby ended", description="This lobby is no longer active.", color=0x747F8D),
@@ -452,7 +473,7 @@ class Pomodoro(commands.Cog):
         self.group_autostart_tasks: dict[int, asyncio.Task] = {}
         self.group_autostart_cancelled: set[int] = set()
 
-    def recover_group_timers_after_gateway_reconnect(self) -> None:
+    async def recover_group_timers_after_gateway_reconnect(self) -> None:
         """Re-arm group Pomodoro background work after a Discord reconnect.
 
         `cog_load` runs only once per process; `on_ready` fires again after gateway
@@ -460,7 +481,7 @@ class Pomodoro(commands.Cog):
         """
         # Waiting lobbies: restore auto-start countdown (same rules as cold start).
         try:
-            for lobby in self.bot.db.get_waiting_group_lobbies():
+            for lobby in (await self.bot.db_worker.run(lambda: self.bot.db.get_waiting_group_lobbies())):
                 created = parse_stored(lobby.get("created_at") or "")
                 age = (utcnow_naive() - created).total_seconds()
                 if 0 <= age < 60 * 60:
@@ -470,13 +491,13 @@ class Pomodoro(commands.Cog):
 
         # Active sessions: reschedule phase countdown from DB timestamps.
         try:
-            for lobby in self.bot.db.get_active_group_lobbies():
+            for lobby in (await self.bot.db_worker.run(lambda: self.bot.db.get_active_group_lobbies())):
                 self._schedule_group_phase_safe(lobby)
         except Exception:
             log.debug("recover_group_timers: active lobbies failed", exc_info=True)
 
     async def cog_load(self) -> None:
-        self.recover_group_timers_after_gateway_reconnect()
+        (await self.recover_group_timers_after_gateway_reconnect())
 
     async def _temptation_pomodoro_work_ended(self, user_id: int, *, work_segment_key: str) -> None:
         t = self.bot.cogs.get("Temptation")
@@ -498,7 +519,7 @@ class Pomodoro(commands.Cog):
             except Exception:
                 log.debug("Temptation break-started hook failed", exc_info=True)
 
-    def _enqueue_solo_pomo_phase_dm(
+    async def _enqueue_solo_pomo_phase_dm(
         self,
         user_id: int,
         *,
@@ -509,21 +530,21 @@ class Pomodoro(commands.Cog):
         footer: str | None = None,
         fields: list[dict] | None = None,
     ) -> None:
-        if not self.bot.db.get_dm_enabled(user_id, "pomodoro_phases"):
+        if not (await self.bot.db_worker.run(lambda: self.bot.db.get_dm_enabled(user_id, "pomodoro_phases"))):
             return
         embed: dict = {"title": title, "description": description, "color": int(color)}
         if fields:
             embed["fields"] = fields
         if footer:
             embed["footer"] = footer
-        self.bot.db.enqueue_outbox(
+        (await self.bot.db_worker.run(lambda: self.bot.db.enqueue_outbox(
             target_type="user",
             target_id=int(user_id),
             kind="pomodoro_phase",
             dedupe_key=dedupe_key,
             settings_key="pomodoro_phases",
             embed=embed,
-        )
+        )))
 
     def _ensure_group_autostart(self, lobby_id: int) -> None:
         # Only one task per lobby.
@@ -544,10 +565,10 @@ class Pomodoro(commands.Cog):
             lines.append(f"<@{uid}>{tag}")
         return "\n".join(lines) if lines else "_No one yet_"
 
-    def _waiting_lobby_embed(self, lobby: dict) -> discord.Embed:
-        members = self.bot.db.get_group_members(lobby["id"])
+    async def _waiting_lobby_embed(self, lobby: dict) -> discord.Embed:
+        members = (await self.bot.db_worker.run(lambda: self.bot.db.get_group_members(lobby["id"])))
         roster = self._group_member_display_lines(members, lobby["host_id"])
-        votes = self.bot.db.get_group_lobby_vote_count(lobby["id"])
+        votes = (await self.bot.db_worker.run(lambda: self.bot.db.get_group_lobby_vote_count(lobby["id"])))
         n = len(members)
         needed = (n // 2) + 1
         work = lobby["work_mins"]
@@ -581,8 +602,8 @@ class Pomodoro(commands.Cog):
         )
         return embed
 
-    def _active_lobby_embed(self, lobby: dict) -> discord.Embed:
-        members = self.bot.db.get_group_members(lobby["id"])
+    async def _active_lobby_embed(self, lobby: dict) -> discord.Embed:
+        members = (await self.bot.db_worker.run(lambda: self.bot.db.get_group_members(lobby["id"])))
         roster = self._group_member_display_lines(members, lobby["host_id"])
         subject = lobby.get("subject") or "Study Group"
         phase = lobby.get("current_phase") or "work"
@@ -622,53 +643,53 @@ class Pomodoro(commands.Cog):
     async def _execute_group_begin(self, interaction: discord.Interaction, lobby: dict, *, edit_message: bool):
         # If the host starts early, cancel any pending autostart.
         self.group_autostart_cancelled.add(lobby["id"])
-        if not self.bot.db.begin_group_lobby(lobby["id"]):
+        if not (await self.bot.db_worker.run(lambda: self.bot.db.begin_group_lobby(lobby["id"]))):
             # Someone else started it already (race). Just refresh what we can and return.
-            lobby_now = self.bot.db.get_group_lobby_by_id(lobby["id"])
+            lobby_now = (await self.bot.db_worker.run(lambda: self.bot.db.get_group_lobby_by_id(lobby["id"])))
             if edit_message and lobby_now and lobby_now.get("state") == "active":
                 try:
                     if interaction.response.is_done():
                         await interaction.edit_original_response(
-                            embed=self._active_lobby_embed(lobby_now),
+                            embed=(await self._active_lobby_embed(lobby_now)),
                             view=GroupLobbyActiveView(self, lobby_now["id"]),
                         )
                     else:
                         await interaction.response.edit_message(
-                            embed=self._active_lobby_embed(lobby_now),
+                            embed=(await self._active_lobby_embed(lobby_now)),
                             view=GroupLobbyActiveView(self, lobby_now["id"]),
                         )
                 except Exception:
                     pass
             return
-        members = self.bot.db.get_group_members(lobby["id"])
+        members = (await self.bot.db_worker.run(lambda: self.bot.db.get_group_members(lobby["id"])))
         study_cog = self.bot.cogs.get("Study")
         for m in members:
             uid = m["user_id"]
-            self.bot.db.ensure_user(uid)
+            (await self.bot.db_worker.run(lambda: self.bot.db.ensure_user(uid)))
             # If a member has an active solo pomodoro timer, end it now so it doesn't keep firing in the background.
-            if self.bot.db.get_active_pomodoro(uid):
-                self.bot.db.end_pomodoro(uid)
+            if (await self.bot.db_worker.run(lambda: self.bot.db.get_active_pomodoro(uid))):
+                (await self.bot.db_worker.run(lambda: self.bot.db.end_pomodoro(uid)))
                 self._cancel_pomo_task(uid)
             # Allow members to study while waiting; auto-end personal session on group start.
-            if self.bot.db.get_active_session(uid):
+            if (await self.bot.db_worker.run(lambda: self.bot.db.get_active_session(uid))):
                 async with self.bot.user_locks[uid]:
                     if study_cog:
                         study_cog._cancel_live_task(uid)
                         study_cog._cancel_motivation_task(uid)
                         study_cog._cancel_inactivity_monitor(uid)
                         study_cog._session_panel_views.pop(uid, None)
-                    s = self.bot.db.end_session(uid, "Auto-ended for Group Pomodoro start")
+                    s = (await self.bot.db_worker.run(lambda: self.bot.db.end_session(uid, "Auto-ended for Group Pomodoro start")))
                     if s and s.get("duration_minutes", 0) >= 5 and study_cog:
                         await study_cog._process_session_rewards(uid, s)
-            self.bot.db.start_session(
+            (await self.bot.db_worker.run(lambda: self.bot.db.start_session(
                 uid,
                 lobby.get("subject", "Group Study"),
                 is_group=True,
                 group_lobby_id=lobby["id"],
                 source_guild_id=interaction.guild_id,
                 allowed_member=True,
-            )
-        lobby = self.bot.db.get_group_lobby_by_id(lobby["id"])
+            )))
+        lobby = (await self.bot.db_worker.run(lambda: self.bot.db.get_group_lobby_by_id(lobby["id"])))
         roster = self._group_member_display_lines(members, lobby["host_id"])
         embed = discord.Embed(
             title="🍅 Group Pomodoro Started!",
@@ -686,7 +707,7 @@ class Pomodoro(commands.Cog):
         phase_key = lobby.get("phase_started_at") or lobby.get("started_at") or str(int(time.time()))
         for m in members:
             uid = int(m["user_id"])
-            self.bot.db.enqueue_outbox(
+            (await self.bot.db_worker.run(lambda: self.bot.db.enqueue_outbox(
                 target_type="user",
                 target_id=uid,
                 kind="group_pomo_started",
@@ -701,18 +722,18 @@ class Pomodoro(commands.Cog):
                     "color": int(WORK_COLOR),
                     "fields": [{"name": "⏳ Work ends in", "value": f"<t:{ends_unix}:R>", "inline": False}],
                 },
-            )
+            )))
 
         if edit_message:
             # Component interactions can only be responded to once; support both direct edit and deferred edits.
             if interaction.response.is_done():
                 await interaction.edit_original_response(
-                    embed=self._active_lobby_embed(lobby),
+                    embed=(await self._active_lobby_embed(lobby)),
                     view=GroupLobbyActiveView(self, lobby["id"]),
                 )
             else:
                 await interaction.response.edit_message(
-                    embed=self._active_lobby_embed(lobby),
+                    embed=(await self._active_lobby_embed(lobby)),
                     view=GroupLobbyActiveView(self, lobby["id"]),
                 )
         else:
@@ -730,7 +751,7 @@ class Pomodoro(commands.Cog):
                 ch = self.bot.get_channel(int(ch_id)) or await self.bot.fetch_channel(int(ch_id))
                 msg = await ch.fetch_message(int(msg_id))
                 await msg.edit(
-                    embed=self._active_lobby_embed(lobby),
+                    embed=(await self._active_lobby_embed(lobby)),
                     view=GroupLobbyActiveView(self, int(lobby["id"])),
                 )
         except Exception as e:
@@ -738,7 +759,7 @@ class Pomodoro(commands.Cog):
 
     async def _group_autostart_loop(self, lobby_id: int):
         try:
-            lobby = self.bot.db.get_group_lobby_by_id(lobby_id)
+            lobby = (await self.bot.db_worker.run(lambda: self.bot.db.get_group_lobby_by_id(lobby_id)))
             if not lobby or lobby.get("state") != "waiting":
                 return
             created = parse_stored(lobby.get("created_at") or "")
@@ -752,10 +773,10 @@ class Pomodoro(commands.Cog):
                 await asyncio.sleep(s1)
 
             # Re-check state and member count
-            lobby = self.bot.db.get_group_lobby_by_id(lobby_id)
+            lobby = (await self.bot.db_worker.run(lambda: self.bot.db.get_group_lobby_by_id(lobby_id)))
             if not lobby or lobby.get("state") != "waiting":
                 return
-            members = self.bot.db.get_group_members(lobby_id)
+            members = (await self.bot.db_worker.run(lambda: self.bot.db.get_group_members(lobby_id)))
             if len(members) < 2:
                 return
 
@@ -782,15 +803,15 @@ class Pomodoro(commands.Cog):
             if lobby_id in self.group_autostart_cancelled:
                 return
 
-            lobby = self.bot.db.get_group_lobby_by_id(lobby_id)
+            lobby = (await self.bot.db_worker.run(lambda: self.bot.db.get_group_lobby_by_id(lobby_id)))
             if not lobby or lobby.get("state") != "waiting":
                 return
-            members = self.bot.db.get_group_members(lobby_id)
+            members = (await self.bot.db_worker.run(lambda: self.bot.db.get_group_members(lobby_id)))
             if len(members) < 2:
                 return
 
             # Auto-begin by editing the public lobby card if we can locate it.
-            if not self.bot.db.begin_group_lobby(lobby_id):
+            if not (await self.bot.db_worker.run(lambda: self.bot.db.begin_group_lobby(lobby_id))):
                 # Someone else started it already (host/vote). Avoid double-starting sessions.
                 return
 
@@ -799,28 +820,28 @@ class Pomodoro(commands.Cog):
             study_cog = self.bot.cogs.get("Study")
             for m in members:
                 uid = m["user_id"]
-                self.bot.db.ensure_user(uid)
-                if self.bot.db.get_active_pomodoro(uid):
-                    self.bot.db.end_pomodoro(uid)
+                (await self.bot.db_worker.run(lambda: self.bot.db.ensure_user(uid)))
+                if (await self.bot.db_worker.run(lambda: self.bot.db.get_active_pomodoro(uid))):
+                    (await self.bot.db_worker.run(lambda: self.bot.db.end_pomodoro(uid)))
                     self._cancel_pomo_task(uid)
-                if self.bot.db.get_active_session(uid):
+                if (await self.bot.db_worker.run(lambda: self.bot.db.get_active_session(uid))):
                     async with self.bot.user_locks[uid]:
                         if study_cog:
                             study_cog._cancel_live_task(uid)
                             study_cog._cancel_motivation_task(uid)
                             study_cog._cancel_inactivity_monitor(uid)
                             study_cog._session_panel_views.pop(uid, None)
-                        s = self.bot.db.end_session(uid, "Auto-ended for Group Pomodoro start")
+                        s = (await self.bot.db_worker.run(lambda: self.bot.db.end_session(uid, "Auto-ended for Group Pomodoro start")))
                         if s and s.get("duration_minutes", 0) >= 5 and study_cog:
                             await study_cog._process_session_rewards(uid, s)
-                self.bot.db.start_session(
+                (await self.bot.db_worker.run(lambda: self.bot.db.start_session(
                     uid,
                     lobby.get("subject", "Group Study"),
                     is_group=True,
                     group_lobby_id=lobby_id,
                     source_guild_id=lobby.get("source_guild_id"),
                     allowed_member=True if lobby.get("source_guild_id") is not None else None,
-                )
+                )))
 
             self._schedule_group_phase(lobby_id, int(lobby["work_mins"]) * 60)
 
@@ -829,7 +850,7 @@ class Pomodoro(commands.Cog):
             phase_key = lobby.get("phase_started_at") or lobby.get("started_at") or str(int(time.time()))
             for m in members:
                 uid = int(m["user_id"])
-                self.bot.db.enqueue_outbox(
+                (await self.bot.db_worker.run(lambda: self.bot.db.enqueue_outbox(
                     target_type="user",
                     target_id=uid,
                     kind="group_pomo_started_auto",
@@ -844,7 +865,7 @@ class Pomodoro(commands.Cog):
                         "color": int(WORK_COLOR),
                         "fields": [{"name": "⏳ Work ends in", "value": f"<t:{ends_unix}:R>", "inline": False}],
                     },
-                )
+                )))
 
             # Update the public lobby card if possible
             ch_id = lobby.get("announce_channel_id")
@@ -854,7 +875,7 @@ class Pomodoro(commands.Cog):
                     ch = self.bot.get_channel(int(ch_id)) or await self.bot.fetch_channel(int(ch_id))
                     msg = await ch.fetch_message(int(msg_id))
                     await msg.edit(
-                        embed=self._active_lobby_embed(lobby),
+                        embed=(await self._active_lobby_embed(lobby)),
                         view=GroupLobbyActiveView(self, lobby_id),
                     )
                 except Exception as e:
@@ -863,7 +884,7 @@ class Pomodoro(commands.Cog):
             self.group_autostart_tasks.pop(lobby_id, None)
 
     async def _pomodoro_stop_inner(self, interaction: discord.Interaction, uid: int):
-        pomo = self.bot.db.end_pomodoro(uid)
+        pomo = (await self.bot.db_worker.run(lambda: self.bot.db.end_pomodoro(uid)))
         if not pomo:
             await interaction.followup.send("❌ No active Pomodoro.", ephemeral=True)
             return
@@ -878,7 +899,7 @@ class Pomodoro(commands.Cog):
         session = None
         loot_drops: list[dict] = []
         async with self.bot.user_locks[uid]:
-            session = self.bot.db.end_session(uid)
+            session = (await self.bot.db_worker.run(lambda: self.bot.db.end_session(uid)))
             if session and session["duration_minutes"] >= 5 and study_cog:
                 _, loot_drops = await study_cog._process_session_rewards(uid, session)
 
@@ -911,7 +932,7 @@ class Pomodoro(commands.Cog):
 
     async def _pomodoro_stop_from_button(self, interaction: discord.Interaction):
         uid = interaction.user.id
-        if not self.bot.db.get_active_pomodoro(uid):
+        if not (await self.bot.db_worker.run(lambda: self.bot.db.get_active_pomodoro(uid))):
             await interaction.response.send_message("❌ No active Pomodoro.", ephemeral=True)
             return
         await interaction.response.defer(ephemeral=True)
@@ -940,14 +961,14 @@ class Pomodoro(commands.Cog):
     async def _phase_countdown(self, user_id: int, seconds: float):
         try:
             await asyncio.sleep(max(seconds, 0))
-            pomo = self.bot.db.get_active_pomodoro(user_id)
+            pomo = (await self.bot.db_worker.run(lambda: self.bot.db.get_active_pomodoro(user_id)))
             if not pomo:
                 return
             await self._transition_phase(user_id, pomo, auto=True)
         except asyncio.CancelledError:
             pass
 
-    def _schedule_phase_safe(self, user_id: int, pomo: dict):
+    async def _schedule_phase_safe(self, user_id: int, pomo: dict):
         phase = pomo["current_phase"]
         if phase == "work":
             duration_secs = pomo["work_minutes"] * 60
@@ -963,15 +984,15 @@ class Pomodoro(commands.Cog):
 
         if remaining < -(duration_secs * 2):
             log.warning(f"Pomodoro for user {user_id} is {-remaining}s overdue — ending")
-            self.bot.db.end_pomodoro(user_id)
-            session = self.bot.db.end_session(user_id)
+            (await self.bot.db_worker.run(lambda: self.bot.db.end_pomodoro(user_id)))
+            session = (await self.bot.db_worker.run(lambda: self.bot.db.end_session(user_id)))
             if session and session.get("duration_minutes", 0) >= 5:
                 study_cog = self.bot.cogs.get("Study")
                 if study_cog:
                     asyncio.create_task(study_cog._process_session_rewards(user_id, session))
                 else:
-                    self.bot.db.add_points(user_id, session["duration_minutes"], "Pomodoro: recovered expired session")
-                    self.bot.db.add_daily_minutes(user_id, session["duration_minutes"])
+                    (await self.bot.db_worker.run(lambda: self.bot.db.add_points(user_id, session["duration_minutes"], "Pomodoro: recovered expired session")))
+                    (await self.bot.db_worker.run(lambda: self.bot.db.add_daily_minutes(user_id, session["duration_minutes"])))
             return
         self._schedule_phase(user_id, max(remaining, 0))
 
@@ -1002,9 +1023,9 @@ class Pomodoro(commands.Cog):
 
             max_cyc = pomo.get("max_cycles") or 0
             if max_cyc > 0 and new_cycle >= max_cyc:
-                new_pomo = self.bot.db.advance_pomodoro(user_id, next_phase)
+                new_pomo = (await self.bot.db_worker.run(lambda: self.bot.db.advance_pomodoro(user_id, next_phase)))
                 if next_phase in ("break", "long_break"):
-                    self.bot.db.pause_session(user_id)
+                    (await self.bot.db_worker.run(lambda: self.bot.db.pause_session(user_id)))
                 break_seg = ""
                 if new_pomo:
                     break_seg = f"{new_pomo['id']}:{new_pomo['phase_started_at']}"
@@ -1022,17 +1043,17 @@ class Pomodoro(commands.Cog):
                     is_grp=bool(pomo.get("is_group")),
                 ):
                     await asyncio.sleep(dur * 60)
-                    self.bot.db.end_pomodoro(uid)
+                    (await self.bot.db_worker.run(lambda: self.bot.db.end_pomodoro(uid)))
                     self._cancel_pomo_task(uid)
                     study_cog = self.bot.cogs.get("Study")
                     if study_cog:
                         study_cog._cancel_live_task(uid)
                         study_cog._cancel_inactivity_monitor(uid)
                     async with self.bot.user_locks[uid]:
-                        session = self.bot.db.end_session(uid)
+                        session = (await self.bot.db_worker.run(lambda: self.bot.db.end_session(uid)))
                         if session and session["duration_minutes"] >= 5:
                             await study_cog._process_session_rewards(uid, session) if study_cog else None
-                    self._enqueue_solo_pomo_phase_dm(
+                    (await self._enqueue_solo_pomo_phase_dm(
                         uid,
                         dedupe_key=f"pomo_solo_complete:{uid}:{ended_pomo_id}:{mc}",
                         title="🏁 Pomodoro Complete!",
@@ -1042,7 +1063,7 @@ class Pomodoro(commands.Cog):
                             {"name": "Cycles Done", "value": str(mc), "inline": True},
                             {"name": "Total Focus Time", "value": fmt_mins(mc * wm), "inline": True},
                         ],
-                    )
+                    ))
                     quest_cog = self.bot.cogs.get("Quests")
                     if quest_cog:
                         await quest_cog.track_quest(uid, "pomo_cycle", mc)
@@ -1052,14 +1073,14 @@ class Pomodoro(commands.Cog):
                             )
 
                 asyncio.create_task(_auto_stop_after_break())
-                self._enqueue_solo_pomo_phase_dm(
+                (await self._enqueue_solo_pomo_phase_dm(
                     user_id,
                     dedupe_key=f"pomo_solo_final_break:{user_id}:{pomo_row_id}:{new_cycle}",
                     title=dm_title,
                     description=dm_desc,
                     color=int(dm_color),
                     footer="Final break — session ends automatically after!",
-                )
+                ))
                 return
         else:
             next_phase = "work"
@@ -1068,20 +1089,20 @@ class Pomodoro(commands.Cog):
             dm_desc = f"Break's over. Time to focus! Cycle #{cycle + 1} starting."
             dm_color = WORK_COLOR
 
-        self.bot.db.advance_pomodoro(user_id, next_phase)
-        fresh = self.bot.db.get_active_pomodoro(user_id)
+        (await self.bot.db_worker.run(lambda: self.bot.db.advance_pomodoro(user_id, next_phase)))
+        fresh = (await self.bot.db_worker.run(lambda: self.bot.db.get_active_pomodoro(user_id)))
         break_seg = f"{fresh['id']}:{fresh['phase_started_at']}" if fresh else ""
 
         if next_phase in ("break", "long_break"):
             await self._temptation_pomodoro_break_started(
                 user_id, int(next_duration), break_segment_key=break_seg
             )
-            self.bot.db.pause_session(user_id)
+            (await self.bot.db_worker.run(lambda: self.bot.db.pause_session(user_id)))
         elif next_phase == "work":
-            self.bot.db.resume_session(user_id)
+            (await self.bot.db_worker.run(lambda: self.bot.db.resume_session(user_id)))
 
         if fresh:
-            self._enqueue_solo_pomo_phase_dm(
+            (await self._enqueue_solo_pomo_phase_dm(
                 user_id,
                 dedupe_key=(
                     f"pomo_solo_phase:{user_id}:{fresh['id']}:"
@@ -1098,7 +1119,7 @@ class Pomodoro(commands.Cog):
                         "inline": False,
                     }
                 ],
-            )
+            ))
 
         self._schedule_phase(user_id, next_duration * 60)
 
@@ -1123,21 +1144,21 @@ class Pomodoro(commands.Cog):
         uid = interaction.user.id
         await interaction.response.defer(ephemeral=True)
         async with self.bot.user_locks[uid]:
-            self.bot.db.ensure_user(uid, str(interaction.user))
+            (await self.bot.db_worker.run(lambda: self.bot.db.ensure_user(uid, str(interaction.user))))
 
-            if self.bot.db.get_active_pomodoro(uid):
+            if (await self.bot.db_worker.run(lambda: self.bot.db.get_active_pomodoro(uid))):
                 await interaction.followup.send("You already have an active Pomodoro. Use `/pomodoro stop` first.", ephemeral=True)
                 return
             # Allow solo Pomodoro to start even if the user is already studying or waiting in a group lobby.
             # We'll auto-end the personal study session (and award rewards) so the Pomodoro session starts cleanly.
             study_cog = self.bot.cogs.get("Study")
-            if self.bot.db.get_active_session(uid):
+            if (await self.bot.db_worker.run(lambda: self.bot.db.get_active_session(uid))):
                 if study_cog:
                     study_cog._cancel_live_task(uid)
                     study_cog._cancel_motivation_task(uid)
                     study_cog._cancel_inactivity_monitor(uid)
                     study_cog._session_panel_views.pop(uid, None)
-                s = self.bot.db.end_session(uid, "Auto-ended for solo Pomodoro start")
+                s = (await self.bot.db_worker.run(lambda: self.bot.db.end_session(uid, "Auto-ended for solo Pomodoro start")))
                 if s and s.get("duration_minutes", 0) >= 5 and study_cog:
                     await study_cog._process_session_rewards(uid, s)
 
@@ -1146,13 +1167,13 @@ class Pomodoro(commands.Cog):
                 interaction.guild_id is not None
                 or await getattr(self.bot, "is_member_of_allowed_guild", lambda _uid: False)(uid)
             )
-            self.bot.db.start_session(
+            (await self.bot.db_worker.run(lambda: self.bot.db.start_session(
                 uid,
                 subject,
                 source_guild_id=interaction.guild_id,
                 allowed_member=is_allowed_member,
-            )
-            self.bot.db.start_pomodoro(uid, work, short_break, long_break, max_cycles)
+            )))
+            (await self.bot.db_worker.run(lambda: self.bot.db.start_pomodoro(uid, work, short_break, long_break, max_cycles)))
 
         end_unix = int(time.time()) + work * 60
         embed = discord.Embed(
@@ -1170,7 +1191,7 @@ class Pomodoro(commands.Cog):
 
     @pomo.command(name="status", description="Check your current Pomodoro phase")
     async def pomo_status(self, interaction: discord.Interaction):
-        pomo = self.bot.db.get_active_pomodoro(interaction.user.id)
+        pomo = (await self.bot.db_worker.run(lambda: self.bot.db.get_active_pomodoro(interaction.user.id)))
         if not pomo:
             await interaction.response.send_message("📭 No active Pomodoro. Start one with `/pomodoro start`!", ephemeral=True)
             return
@@ -1178,14 +1199,14 @@ class Pomodoro(commands.Cog):
 
     @pomo.command(name="skip", description="Skip the current phase")
     async def pomo_skip(self, interaction: discord.Interaction):
-        pomo = self.bot.db.get_active_pomodoro(interaction.user.id)
+        pomo = (await self.bot.db_worker.run(lambda: self.bot.db.get_active_pomodoro(interaction.user.id)))
         if not pomo:
             await interaction.response.send_message("❌ No active Pomodoro.", ephemeral=True)
             return
         self._cancel_pomo_task(interaction.user.id)
         await interaction.response.defer(ephemeral=True)
         await self._transition_phase(interaction.user.id, pomo, auto=False)
-        new_pomo = self.bot.db.get_active_pomodoro(interaction.user.id)
+        new_pomo = (await self.bot.db_worker.run(lambda: self.bot.db.get_active_pomodoro(interaction.user.id)))
         embed = discord.Embed(title="⏭️ Phase Skipped!", color=0x5865F2)
         if new_pomo:
             phase_map = {"work": "🔴 Focus", "break": "☕ Break", "long_break": "🏖️ Long Break"}
@@ -1195,12 +1216,12 @@ class Pomodoro(commands.Cog):
     @pomo.command(name="stop", description="Stop your Pomodoro session")
     async def pomo_stop(self, interaction: discord.Interaction):
         uid = interaction.user.id
-        if not self.bot.db.get_active_pomodoro(uid):
+        if not (await self.bot.db_worker.run(lambda: self.bot.db.get_active_pomodoro(uid))):
             await interaction.response.send_message("❌ No active Pomodoro.", ephemeral=True)
             return
 
         await interaction.response.defer(ephemeral=True)
-        pomo = self.bot.db.end_pomodoro(uid)
+        pomo = (await self.bot.db_worker.run(lambda: self.bot.db.end_pomodoro(uid)))
         if not pomo:
             await interaction.followup.send("❌ No active Pomodoro.", ephemeral=True)
             return
@@ -1215,7 +1236,7 @@ class Pomodoro(commands.Cog):
         session = None
         loot_drops: list[dict] = []
         async with self.bot.user_locks[uid]:
-            session = self.bot.db.end_session(uid)
+            session = (await self.bot.db_worker.run(lambda: self.bot.db.end_session(uid)))
             if session and session["duration_minutes"] >= 5 and study_cog:
                 _, loot_drops = await study_cog._process_session_rewards(uid, session)
 
@@ -1257,29 +1278,29 @@ class Pomodoro(commands.Cog):
                           subject: str = "Study Group"):
         uid = interaction.user.id
         async with self.bot.user_locks[uid]:
-            self.bot.db.ensure_user(uid, str(interaction.user))
+            (await self.bot.db_worker.run(lambda: self.bot.db.ensure_user(uid, str(interaction.user))))
 
             # Users may study while waiting/hosting; group begin will auto-end personal sessions.
-            if self.bot.db.get_user_group_lobby(uid):
+            if (await self.bot.db_worker.run(lambda: self.bot.db.get_user_group_lobby(uid))):
                 await interaction.response.send_message("You're already in a group lobby.", ephemeral=True)
                 return
 
-            result = self.bot.db.create_group_lobby(uid, work, short_break, long_break, cycles, subject)
+            result = (await self.bot.db_worker.run(lambda: self.bot.db.create_group_lobby(uid, work, short_break, long_break, cycles, subject)))
 
-        lobby = self.bot.db.get_group_lobby_by_id(result["id"])
-        embed = self._waiting_lobby_embed(lobby)
+        lobby = (await self.bot.db_worker.run(lambda: self.bot.db.get_group_lobby_by_id(result["id"])))
+        embed = (await self._waiting_lobby_embed(lobby))
         view = GroupLobbyWaitingView(self, result["id"])
         await interaction.response.send_message(embed=embed, view=view)
 
         # Store where the lobby card was posted so auto-start can edit it later.
         try:
             msg = await interaction.original_response()
-            self.bot.db.set_group_lobby_announce(
+            (await self.bot.db_worker.run(lambda: self.bot.db.set_group_lobby_announce(
                 result["id"],
                 source_guild_id=interaction.guild_id,
                 channel_id=interaction.channel_id,
                 message_id=msg.id,
-            )
+            )))
         except Exception:
             # Not fatal; auto-start will still happen, just without editing the card.
             pass
@@ -1292,14 +1313,14 @@ class Pomodoro(commands.Cog):
     async def group_join(self, interaction: discord.Interaction, code: str):
         uid = interaction.user.id
         async with self.bot.user_locks[uid]:
-            self.bot.db.ensure_user(uid, str(interaction.user))
+            (await self.bot.db_worker.run(lambda: self.bot.db.ensure_user(uid, str(interaction.user))))
 
             # Users may study while waiting in the lobby; group begin will auto-end personal sessions.
-            if self.bot.db.get_user_group_lobby(uid):
+            if (await self.bot.db_worker.run(lambda: self.bot.db.get_user_group_lobby(uid))):
                 await interaction.response.send_message("You're already in a lobby.", ephemeral=True)
                 return
 
-            result = self.bot.db.join_group_lobby(code, uid)
+            result = (await self.bot.db_worker.run(lambda: self.bot.db.join_group_lobby(code, uid)))
             if not result:
                 await interaction.response.send_message("Invalid or expired code.", ephemeral=True)
                 return
@@ -1307,7 +1328,7 @@ class Pomodoro(commands.Cog):
                 await interaction.response.send_message("Lobby is full (max 10).", ephemeral=True)
                 return
 
-        members = self.bot.db.get_group_members(result["id"])
+        members = (await self.bot.db_worker.run(lambda: self.bot.db.get_group_members(result["id"])))
         embed = discord.Embed(
             title=f"🍅 Joined Group Pomodoro!",
             description=f"**{result.get('subject', 'Study Group')}** · Code: `{code.upper()}`\n"
@@ -1320,7 +1341,7 @@ class Pomodoro(commands.Cog):
     async def group_begin(self, interaction: discord.Interaction):
         uid = interaction.user.id
         await interaction.response.defer()
-        lobby = self.bot.db.get_user_group_lobby(uid)
+        lobby = (await self.bot.db_worker.run(lambda: self.bot.db.get_user_group_lobby(uid)))
         if not lobby:
             await interaction.followup.send("You're not in a lobby.", ephemeral=True)
             return
@@ -1338,7 +1359,7 @@ class Pomodoro(commands.Cog):
         await interaction.response.defer(ephemeral=True)
         session = None
         async with self.bot.user_locks[uid]:
-            lobby = self.bot.db.leave_group_lobby(uid)
+            lobby = (await self.bot.db_worker.run(lambda: self.bot.db.leave_group_lobby(uid)))
             if not lobby:
                 await interaction.followup.send("You're not in a lobby.", ephemeral=True)
                 return
@@ -1350,7 +1371,7 @@ class Pomodoro(commands.Cog):
                 study_cog._cancel_motivation_task(uid)
                 study_cog._cancel_inactivity_monitor(uid)
                 study_cog._session_panel_views.pop(uid, None)
-            session = self.bot.db.end_session(uid)
+            session = (await self.bot.db_worker.run(lambda: self.bot.db.end_session(uid)))
             if session and session["duration_minutes"] >= 5 and study_cog:
                 await study_cog._process_session_rewards(uid, session)
 
@@ -1364,15 +1385,15 @@ class Pomodoro(commands.Cog):
 
     @group.command(name="status", description="Check group lobby status")
     async def group_status(self, interaction: discord.Interaction):
-        lobby = self.bot.db.get_user_group_lobby(interaction.user.id)
+        lobby = (await self.bot.db_worker.run(lambda: self.bot.db.get_user_group_lobby(interaction.user.id)))
         if not lobby:
             await interaction.response.send_message("You're not in a lobby.", ephemeral=True)
             return
 
-        members = self.bot.db.get_group_members(lobby["id"])
+        members = (await self.bot.db_worker.run(lambda: self.bot.db.get_group_members(lobby["id"])))
         member_names = []
         for m in members:
-            u = self.bot.db.get_user(m["user_id"])
+            u = (await self.bot.db_worker.run(lambda: self.bot.db.get_user(m["user_id"])))
             name = u.get("username", f"User {m['user_id']}") if u else f"User {m['user_id']}"
             host_tag = " 👑" if m["user_id"] == lobby["host_id"] else ""
             member_names.append(f"• {name}{host_tag}")
@@ -1447,16 +1468,16 @@ class Pomodoro(commands.Cog):
     async def _dm_group_recovered(self, lobby: dict, *, overdue_seconds: int) -> None:
         """Quiet DM note after restart if we missed a phase transition."""
         try:
-            members = self.bot.db.get_group_members(int(lobby["id"]))
+            members = (await self.bot.db_worker.run(lambda: self.bot.db.get_group_members(int(lobby["id"]))))
             phase = (lobby.get("current_phase") or "work").replace("_", " ").title()
             subj = lobby.get("subject") or "Group Study"
             ps = lobby.get("phase_started_at") or ""
             lid = int(lobby["id"])
             for m in members:
                 uid = int(m["user_id"])
-                if not self.bot.db.get_dm_enabled(uid, "group_pomo"):
+                if not (await self.bot.db_worker.run(lambda: self.bot.db.get_dm_enabled(uid, "group_pomo"))):
                     continue
-                self.bot.db.enqueue_outbox(
+                (await self.bot.db_worker.run(lambda: self.bot.db.enqueue_outbox(
                     target_type="user",
                     target_id=uid,
                     kind="group_pomo_recovered",
@@ -1471,7 +1492,7 @@ class Pomodoro(commands.Cog):
                         ),
                         "color": int(0x99AAB5),
                     },
-                )
+                )))
                 await asyncio.sleep(0.15)
         except Exception:
             log.debug("group_pomo recovery DM enqueue failed", exc_info=True)
@@ -1479,7 +1500,7 @@ class Pomodoro(commands.Cog):
     async def _group_phase_countdown(self, lobby_id: int, seconds: float):
         try:
             await asyncio.sleep(seconds)
-            lobby = self.bot.db.get_group_lobby_by_id(lobby_id)
+            lobby = (await self.bot.db_worker.run(lambda: self.bot.db.get_group_lobby_by_id(lobby_id)))
             if not lobby or lobby["state"] != "active":
                 return
             await self._group_transition(lobby)
@@ -1489,7 +1510,7 @@ class Pomodoro(commands.Cog):
     async def _group_transition(self, lobby: dict):
         phase = lobby["current_phase"]
         cycle = lobby.get("current_cycle", 0)
-        members = self.bot.db.get_group_members(lobby["id"])
+        members = (await self.bot.db_worker.run(lambda: self.bot.db.get_group_members(lobby["id"])))
 
         if phase == "work":
             new_cycle = cycle
@@ -1506,18 +1527,18 @@ class Pomodoro(commands.Cog):
                 return
 
             for m in members:
-                self.bot.db.pause_session(m["user_id"])
+                (await self.bot.db_worker.run(lambda: self.bot.db.pause_session(m["user_id"])))
         else:
             next_phase = "work"
             next_duration = lobby["work_mins"]
             new_cycle = cycle + 1
 
             for m in members:
-                self.bot.db.resume_session(m["user_id"])
+                (await self.bot.db_worker.run(lambda: self.bot.db.resume_session(m["user_id"])))
 
         old_phase_started = lobby.get("phase_started_at") or ""
-        self.bot.db.advance_group_phase(lobby["id"], next_phase, new_cycle)
-        lobby_after = self.bot.db.get_group_lobby_by_id(int(lobby["id"])) or lobby
+        (await self.bot.db_worker.run(lambda: self.bot.db.advance_group_phase(lobby["id"], next_phase, new_cycle)))
+        lobby_after = (await self.bot.db_worker.run(lambda: self.bot.db.get_group_lobby_by_id(int(lobby["id"])))) or lobby
         new_phase_started = lobby_after.get("phase_started_at") or ""
 
         if phase == "work" and next_phase in ("break", "long_break"):
@@ -1538,7 +1559,7 @@ class Pomodoro(commands.Cog):
         for m in members:
             uid = int(m["user_id"])
             phase_key = lobby.get("phase_started_at") or lobby.get("started_at") or str(int(time.time()))
-            self.bot.db.enqueue_outbox(
+            (await self.bot.db_worker.run(lambda: self.bot.db.enqueue_outbox(
                 target_type="user",
                 target_id=uid,
                 kind="group_pomo_phase",
@@ -1553,19 +1574,19 @@ class Pomodoro(commands.Cog):
                     "color": int(color),
                     "fields": [{"name": "⏳ Ends in", "value": f"<t:{int(time.time()) + next_duration * 60}:R>", "inline": False}],
                 },
-            )
+            )))
             await asyncio.sleep(0.15)
 
         self._schedule_group_phase(lobby["id"], next_duration * 60)
 
     async def _end_group_session(self, lobby: dict, members: list[dict]):
-        self.bot.db.end_group_lobby(lobby["id"])
+        (await self.bot.db_worker.run(lambda: self.bot.db.end_group_lobby(lobby["id"])))
         study_cog = self.bot.cogs.get("Study")
         quest_cog = self.bot.cogs.get("Quests")
 
         perks_with_aura = set()
         for m in members:
-            if "grandmaster_aura" in self.bot.db.get_prestige_perks(m["user_id"]):
+            if "grandmaster_aura" in (await self.bot.db_worker.run(lambda: self.bot.db.get_prestige_perks(m["user_id"]))):
                 perks_with_aura.add(m["user_id"])
 
         group_xp_mult = 1.5 if perks_with_aura else 1.25
@@ -1573,7 +1594,7 @@ class Pomodoro(commands.Cog):
         for m in members:
             uid = m["user_id"]
             async with self.bot.user_locks[uid]:
-                session = self.bot.db.end_session(uid)
+                session = (await self.bot.db_worker.run(lambda: self.bot.db.end_session(uid)))
                 if session and session["duration_minutes"] >= 5 and study_cog:
                     await study_cog._process_session_rewards(uid, session, group_xp_mult=group_xp_mult)
 
@@ -1582,7 +1603,7 @@ class Pomodoro(commands.Cog):
 
             try:
                 phase_key = lobby.get("phase_started_at") or lobby.get("started_at") or str(int(time.time()))
-                self.bot.db.enqueue_outbox(
+                (await self.bot.db_worker.run(lambda: self.bot.db.enqueue_outbox(
                     target_type="user",
                     target_id=int(uid),
                     kind="group_pomo_complete",
@@ -1596,7 +1617,7 @@ class Pomodoro(commands.Cog):
                         ),
                         "color": 0xFFD700,
                     },
-                )
+                )))
             except Exception:
                 pass
             await asyncio.sleep(0.15)

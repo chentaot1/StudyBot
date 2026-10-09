@@ -51,8 +51,8 @@ class Tasks(commands.Cog):
     async def _autocomplete_project_id(
         self, interaction: discord.Interaction, current: str
     ) -> list[app_commands.Choice[int]]:
-        self.bot.db.ensure_user(interaction.user.id, str(interaction.user))
-        projects = self.bot.db.get_projects(interaction.user.id)
+        (await self.bot.db_worker.run(lambda: self.bot.db.ensure_user(interaction.user.id, str(interaction.user))))
+        projects = (await self.bot.db_worker.run(lambda: self.bot.db.get_projects(interaction.user.id)))
         choices = []
         for p in projects:
             label = f"#{p['id']} — {p['name']}"
@@ -83,7 +83,7 @@ class Tasks(commands.Cog):
     async def task_add(
         self,
         interaction: discord.Interaction,
-        title: app_commands.Range[str, 1, 100],
+        title: app_commands.Range[str, 0, 100] = "",
         points: app_commands.Range[int, 1, 500] = 10,
         priority: str = "medium",
         description: app_commands.Range[str, 0, 500] = "",
@@ -92,35 +92,39 @@ class Tasks(commands.Cog):
         review: bool = False,
         interval: app_commands.Range[int, 1, 60] = 1
     ):
-        self.bot.db.ensure_user(interaction.user.id, str(interaction.user))
+        if not title.strip():
+            await self.open_task_form(interaction)
+            return
+        await interaction.response.defer()
+        (await self.bot.db_worker.run(lambda: self.bot.db.ensure_user(interaction.user.id, str(interaction.user))))
 
         parsed_due = None
         if due_date:
             parsed_due = parse_due_date(due_date)
             if not parsed_due:
-                await interaction.response.send_message(
+                await interaction.followup.send(
                     "❌ Invalid date. Use **MM/DD**, **MM/DD/YYYY**, **MM-DD-YYYY**, or **YYYY-MM-DD**.",
                     ephemeral=True,
                 )
                 return
 
         if project_id:
-            project = self.bot.db.get_project(project_id, interaction.user.id)
+            project = (await self.bot.db_worker.run(lambda: self.bot.db.get_project(project_id, interaction.user.id)))
             if not project:
-                await interaction.response.send_message(f"❌ Project `#{project_id}` not found.", ephemeral=True)
+                await interaction.followup.send(f"❌ Project `#{project_id}` not found.", ephemeral=True)
                 return
 
-        task_id = self.bot.db.add_task(
+        task_id = (await self.bot.db_worker.run(lambda: self.bot.db.add_task(
             interaction.user.id, title, description, points, priority, parsed_due,
             project_id=project_id, is_review=review, review_interval=interval
-        )
+        )))
 
         embed = discord.Embed(title=f"{'🔁' if review else PRI_EMOJI[priority]} Task Added", color=PRI_COLOR[priority])
         embed.add_field(name="Task", value=title, inline=False)
         embed.add_field(name="💰 Points", value=str(points), inline=True)
         embed.add_field(name="Priority", value=priority.capitalize(), inline=True)
         if project_id:
-            project = self.bot.db.get_project(project_id, interaction.user.id)
+            project = (await self.bot.db_worker.run(lambda: self.bot.db.get_project(project_id, interaction.user.id)))
             embed.add_field(name="📁 Project", value=project["name"], inline=True)
         if review:
             embed.add_field(name="🔁 SRS Review", value=f"Repeats every {interval}d → {next_srs_interval(interval)}d → ...", inline=False)
@@ -129,7 +133,7 @@ class Tasks(commands.Cog):
         if description:
             embed.add_field(name="Notes", value=description, inline=False)
         embed.set_footer(text=f"Task #{task_id} • Complete with /task complete {task_id}")
-        await interaction.response.send_message(embed=embed)
+        await interaction.followup.send(embed=embed)
 
         quest_cog = self.bot.cogs.get("Quests")
         if quest_cog:
@@ -141,16 +145,26 @@ class Tasks(commands.Cog):
     ) -> list[app_commands.Choice[int]]:
         return await self._autocomplete_project_id(interaction, current)
 
+    async def open_task_form(self, interaction, *, title="", description="", source_url=None):
+        from views.forms import TaskModal
+        projects = await self.bot.db_worker.run(self.bot.db.get_projects, interaction.user.id)
+        await interaction.response.send_modal(TaskModal(self.bot, interaction.user.id, projects, title=title, description=description, source_url=source_url))
+
+    @task.command(name="create", description="Create a task with a guided form")
+    async def task_create(self, interaction: discord.Interaction):
+        await self.open_task_form(interaction)
+
     # ── /task list ────────────────────────────────────────────────────────────
 
     @task.command(name="list", description="View your pending tasks")
     @app_commands.describe(show_completed="Also show completed tasks", project_id="Filter by project")
     async def task_list(self, interaction: discord.Interaction, show_completed: bool = False, project_id: Optional[int] = None):
-        self.bot.db.ensure_user(interaction.user.id, str(interaction.user))
-        tasks = self.bot.db.get_user_tasks(interaction.user.id, include_done=show_completed, project_id=project_id)
+        await interaction.response.defer(ephemeral=True)
+        (await self.bot.db_worker.run(lambda: self.bot.db.ensure_user(interaction.user.id, str(interaction.user))))
+        tasks = (await self.bot.db_worker.run(lambda: self.bot.db.get_user_tasks(interaction.user.id, include_done=show_completed, project_id=project_id)))
 
         if not tasks:
-            await interaction.response.send_message("✅ No pending tasks! Add one with `/task add`.", ephemeral=True)
+            await interaction.followup.send("✅ No pending tasks! Add one with `/task add`.", ephemeral=True)
             return
 
         embed = discord.Embed(title="📋 Tasks", color=0x5865F2)
@@ -174,7 +188,7 @@ class Tasks(commands.Cog):
                     elif diff == 0: due_note = " 🔥 **Due today**"
                     elif diff <= 3: due_note = f" 📅 {diff}d"
                 tnum = t.get("user_task_num") or t["id"]
-                lines.append(f"{status} `#{tnum}` **{t['title']}**{due_note} — 💰 {t['points']}")
+                lines.append(f"{status} `#{tnum}` **{t['title']}**{due_note} — 💰 {t['points']}" + (f" · [source]({t['source_message_url']})" if t.get("source_message_url") else ""))
             embed.add_field(
                 name=f"📁 {proj}" if proj != "No Project" else "📋 Tasks",
                 value="\n".join(lines), inline=False
@@ -182,7 +196,7 @@ class Tasks(commands.Cog):
 
         pts_avail = sum(t["points"] for t in pending)
         embed.set_footer(text=f"{len(pending)} pending · {pts_avail} pts available")
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
     @task_list.autocomplete("project_id")
     async def task_list_project_autocomplete(
@@ -200,9 +214,9 @@ class Tasks(commands.Cog):
             await self._task_complete_inner(interaction, task_id)
 
     async def _task_complete_inner(self, interaction: discord.Interaction, task_id: int):
-        self.bot.db.ensure_user(interaction.user.id, str(interaction.user))
+        (await self.bot.db_worker.run(lambda: self.bot.db.ensure_user(interaction.user.id, str(interaction.user))))
 
-        all_tasks = self.bot.db.get_user_tasks(interaction.user.id, include_done=False)
+        all_tasks = (await self.bot.db_worker.run(lambda: self.bot.db.get_user_tasks(interaction.user.id, include_done=False)))
         task = next((t for t in all_tasks if (t.get("user_task_num") or t["id"]) == task_id), None)
         if not task:
             await interaction.followup.send(f"❌ Task `#{task_id}` not found or already done.", ephemeral=True)
@@ -217,7 +231,7 @@ class Tasks(commands.Cog):
             new_interval = next_srs_interval(old_interval)
             next_date = (datetime.now(EST).date() + timedelta(days=new_interval)).strftime("%Y-%m-%d")
 
-        result = self.bot.db.complete_task_with_review(db_id, interaction.user.id)
+        result = (await self.bot.db_worker.run(lambda: self.bot.db.complete_task_with_review(db_id, interaction.user.id)))
 
         if not result:
             await interaction.followup.send("❌ Task completion failed.", ephemeral=True)
@@ -250,7 +264,7 @@ class Tasks(commands.Cog):
             )
 
         if task.get("project_id"):
-            stats = self.bot.db.get_project_task_stats(task["project_id"])
+            stats = (await self.bot.db_worker.run(lambda: self.bot.db.get_project_task_stats(task["project_id"])))
             pct = int(stats["done"] / stats["total"] * 100) if stats["total"] else 0
             embed.add_field(
                 name=f"📁 {task.get('project_name', 'Project')}",
@@ -299,8 +313,8 @@ class Tasks(commands.Cog):
             await interaction.followup.send(f"❌ {err}", ephemeral=True)
             return
 
-        self.bot.db.ensure_user(interaction.user.id, str(interaction.user))
-        pending = self.bot.db.get_user_tasks(interaction.user.id, include_done=False)
+        (await self.bot.db_worker.run(lambda: self.bot.db.ensure_user(interaction.user.id, str(interaction.user))))
+        pending = (await self.bot.db_worker.run(lambda: self.bot.db.get_user_tasks(interaction.user.id, include_done=False)))
         by_num = {(t.get("user_task_num") or t["id"]): t for t in pending}
         missing = [n for n in ids if n not in by_num]
         if missing:
@@ -321,29 +335,29 @@ class Tasks(commands.Cog):
 
         async def _rollback_batch(done: list[dict]):
             for item in reversed(done):
-                t = self.bot.db.undo_task_complete(item["task_id"], uid)
+                t = (await self.bot.db_worker.run(lambda: self.bot.db.undo_task_complete(item["task_id"], uid)))
                 if not t:
                     continue
-                user_pre = self.bot.db.get_user(uid)
+                user_pre = (await self.bot.db_worker.run(lambda: self.bot.db.get_user(uid)))
                 pts = item["pts_earned"]
                 rev = min(pts, user_pre["points"]) if user_pre else 0
-                self.bot.db.add_points(
+                (await self.bot.db_worker.run(lambda: self.bot.db.add_points(
                     uid, -rev, f"Rollback batch: {t['title']}", track_earned=False
-                )
+                )))
                 if item["is_review"]:
                     if item.get("next_review_id") is not None:
-                        self.bot.db.delete_task(item["next_review_id"], uid)
+                        (await self.bot.db_worker.run(lambda: self.bot.db.delete_task(item["next_review_id"], uid)))
                     else:
-                        pend = self.bot.db.get_user_tasks(uid, include_done=False)
+                        pend = (await self.bot.db_worker.run(lambda: self.bot.db.get_user_tasks(uid, include_done=False)))
                         for row in pend:
                             if row["title"] == t["title"] and row["is_review"] and not row["completed"]:
-                                self.bot.db.delete_task(row["id"], uid)
+                                (await self.bot.db_worker.run(lambda: self.bot.db.delete_task(row["id"], uid)))
                                 break
 
         for n in ids:
             task = by_num[n]
             db_id = task["id"]
-            result = self.bot.db.complete_task_with_review(db_id, interaction.user.id)
+            result = (await self.bot.db_worker.run(lambda: self.bot.db.complete_task_with_review(db_id, interaction.user.id)))
             if not result:
                 await _rollback_batch(undo_items)
                 await interaction.followup.send(
@@ -373,7 +387,7 @@ class Tasks(commands.Cog):
                     old_interval = int(task.get("review_interval") or 1)
                     await badge_cog.check_srs_review_badges(interaction.user.id, interval_before_days=old_interval)
 
-        user = self.bot.db.get_user(interaction.user.id)
+        user = (await self.bot.db_worker.run(lambda: self.bot.db.get_user(interaction.user.id)))
         embed = discord.Embed(
             title=f"🎉 {len(ids)} Tasks Complete!",
             color=COLOR_SUCCESS,
@@ -394,8 +408,8 @@ class Tasks(commands.Cog):
 
     @task_complete.autocomplete("task_id")
     async def task_complete_autocomplete(self, interaction: discord.Interaction, current: str) -> list[app_commands.Choice[int]]:
-        self.bot.db.ensure_user(interaction.user.id, str(interaction.user))
-        tasks = self.bot.db.get_user_tasks(interaction.user.id, include_done=False)
+        (await self.bot.db_worker.run(lambda: self.bot.db.ensure_user(interaction.user.id, str(interaction.user))))
+        tasks = (await self.bot.db_worker.run(lambda: self.bot.db.get_user_tasks(interaction.user.id, include_done=False)))
         choices = []
         for t in tasks:
             tnum = t.get("user_task_num") or t["id"]
@@ -412,16 +426,16 @@ class Tasks(commands.Cog):
     @task.command(name="delete", description="Delete a task")
     @app_commands.describe(task_id="Task number to delete")
     async def task_delete(self, interaction: discord.Interaction, task_id: int):
-        db_id = self.bot.db.resolve_task_num(interaction.user.id, task_id)
-        if db_id and self.bot.db.delete_task(db_id, interaction.user.id):
+        db_id = (await self.bot.db_worker.run(lambda: self.bot.db.resolve_task_num(interaction.user.id, task_id)))
+        if db_id and (await self.bot.db_worker.run(lambda: self.bot.db.delete_task(db_id, interaction.user.id))):
             await interaction.response.send_message(f"🗑️ Task `#{task_id}` deleted.", ephemeral=True)
         else:
             await interaction.response.send_message(f"❌ Task `#{task_id}` not found.", ephemeral=True)
 
     @task_delete.autocomplete("task_id")
     async def task_delete_autocomplete(self, interaction: discord.Interaction, current: str) -> list[app_commands.Choice[int]]:
-        self.bot.db.ensure_user(interaction.user.id, str(interaction.user))
-        tasks = self.bot.db.get_user_tasks(interaction.user.id, include_done=True)
+        (await self.bot.db_worker.run(lambda: self.bot.db.ensure_user(interaction.user.id, str(interaction.user))))
+        tasks = (await self.bot.db_worker.run(lambda: self.bot.db.get_user_tasks(interaction.user.id, include_done=True)))
         choices = []
         for t in tasks:
             tnum = t.get("user_task_num") or t["id"]
@@ -437,7 +451,7 @@ class Tasks(commands.Cog):
 
     @task.command(name="history", description="View recently completed tasks")
     async def task_history(self, interaction: discord.Interaction):
-        tasks = self.bot.db.get_user_tasks(interaction.user.id, include_done=True)
+        tasks = (await self.bot.db_worker.run(lambda: self.bot.db.get_user_tasks(interaction.user.id, include_done=True)))
         done = [t for t in tasks if t["completed"]][-10:]
         if not done:
             await interaction.response.send_message("No completed tasks yet!", ephemeral=True)
@@ -456,8 +470,8 @@ class Tasks(commands.Cog):
 
     @task.command(name="reviews", description="View all your due SRS review tasks")
     async def task_reviews(self, interaction: discord.Interaction):
-        self.bot.db.ensure_user(interaction.user.id, str(interaction.user))
-        reviews = self.bot.db.get_due_reviews(interaction.user.id)
+        (await self.bot.db_worker.run(lambda: self.bot.db.ensure_user(interaction.user.id, str(interaction.user))))
+        reviews = (await self.bot.db_worker.run(lambda: self.bot.db.get_due_reviews(interaction.user.id)))
         if not reviews:
             await interaction.response.send_message("🎉 No reviews due! Check back later.", ephemeral=True)
             return
@@ -494,7 +508,7 @@ class UndoBatchTaskView(discord.ui.View):
             await interaction.response.send_message("This isn't your batch.", ephemeral=True)
             return
         for item in reversed(self.items):
-            task = self.bot.db.undo_task_complete(item["task_id"], self.user_id)
+            task = (await self.bot.db_worker.run(lambda: self.bot.db.undo_task_complete(item["task_id"], self.user_id)))
             if not task:
                 await interaction.response.edit_message(
                     content="❌ Couldn't undo — a task may have changed. Check `/task list`.",
@@ -503,29 +517,29 @@ class UndoBatchTaskView(discord.ui.View):
                 )
                 self.stop()
                 return
-            user_pre = self.bot.db.get_user(self.user_id)
+            user_pre = (await self.bot.db_worker.run(lambda: self.bot.db.get_user(self.user_id)))
             pts = item["pts_earned"]
             if user_pre and user_pre["points"] < pts:
                 reversal = user_pre["points"]
             else:
                 reversal = pts
-            self.bot.db.add_points(
+            (await self.bot.db_worker.run(lambda: self.bot.db.add_points(
                 self.user_id,
                 -reversal,
                 f"Undo batch: {task['title']}",
                 track_earned=False,
-            )
+            )))
             if item["is_review"]:
                 if item.get("next_review_id") is not None:
-                    self.bot.db.delete_task(item["next_review_id"], self.user_id)
+                    (await self.bot.db_worker.run(lambda: self.bot.db.delete_task(item["next_review_id"], self.user_id)))
                 else:
-                    all_tasks = self.bot.db.get_user_tasks(self.user_id, include_done=False)
+                    all_tasks = (await self.bot.db_worker.run(lambda: self.bot.db.get_user_tasks(self.user_id, include_done=False)))
                     for t in all_tasks:
                         if t["title"] == task["title"] and t["is_review"] and not t["completed"]:
-                            self.bot.db.delete_task(t["id"], self.user_id)
+                            (await self.bot.db_worker.run(lambda: self.bot.db.delete_task(t["id"], self.user_id)))
                             break
 
-        user = self.bot.db.get_user(self.user_id)
+        user = (await self.bot.db_worker.run(lambda: self.bot.db.get_user(self.user_id)))
         embed = discord.Embed(
             title="↩️ Batch undone",
             description=f"Re-opened **{len(self.items)}** task(s).",
@@ -559,7 +573,7 @@ class UndoTaskView(discord.ui.View):
         if interaction.user.id != self.user_id:
             await interaction.response.send_message("This isn't your task.", ephemeral=True)
             return
-        task = self.bot.db.undo_task_complete(self.task_id, self.user_id)
+        task = (await self.bot.db_worker.run(lambda: self.bot.db.undo_task_complete(self.task_id, self.user_id)))
         if not task:
             await interaction.response.edit_message(
                 content="❌ Couldn't undo — task may have been modified.", view=None
@@ -567,29 +581,29 @@ class UndoTaskView(discord.ui.View):
             self.stop()
             return
 
-        user_pre = self.bot.db.get_user(self.user_id)
+        user_pre = (await self.bot.db_worker.run(lambda: self.bot.db.get_user(self.user_id)))
         if user_pre and user_pre["points"] < self.points:
             reversal = user_pre["points"]
         else:
             reversal = self.points
 
-        self.bot.db.add_points(
+        (await self.bot.db_worker.run(lambda: self.bot.db.add_points(
             self.user_id,
             -reversal,
             f"Undo task: {task['title']}",
             track_earned=False,
-        )
+        )))
 
         if self.is_review:
             if self.next_review_id is not None:
-                self.bot.db.delete_task(self.next_review_id, self.user_id)
+                (await self.bot.db_worker.run(lambda: self.bot.db.delete_task(self.next_review_id, self.user_id)))
             else:
-                all_tasks = self.bot.db.get_user_tasks(self.user_id, include_done=False)
+                all_tasks = (await self.bot.db_worker.run(lambda: self.bot.db.get_user_tasks(self.user_id, include_done=False)))
                 for t in all_tasks:
                     if t["title"] == task["title"] and t["is_review"] and not t["completed"]:
-                        self.bot.db.delete_task(t["id"], self.user_id)
+                        (await self.bot.db_worker.run(lambda: self.bot.db.delete_task(t["id"], self.user_id)))
                         break
-        user = self.bot.db.get_user(self.user_id)
+        user = (await self.bot.db_worker.run(lambda: self.bot.db.get_user(self.user_id)))
         embed = discord.Embed(
             title="↩️ Undone",
             description=f"**{task['title']}** marked as pending again.",

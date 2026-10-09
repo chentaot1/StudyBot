@@ -4,7 +4,20 @@ StudyBot is a self-hosted study and accountability system for Discord. It combin
 
 The systems share the same study history: a completed focus session can update a daily goal, advance a quest, contribute damage to a community raid boss, and appear in a weekly report. Users can also define their own rewards or use a productivity-only mode without the RPG features.
 
-The implementation uses Python, discord.py, SQLite, and APScheduler, with 20 feature modules covering the study workflow, progression, social interactions, and administration.
+The implementation uses Python, discord.py, SQLite, and APScheduler, with 21 feature modules covering the study workflow, progression, social interactions, and administration.
+
+## Updated Discord experience
+
+The bot now uses discord.py 2.7.1 and Discord's newer interaction components:
+
+- `/today` opens a private interactive dashboard with goals, tasks and reviews, the next study block, session controls, and quick forms. Server RPG sections respect the guild and productivity-only settings.
+- `/task create`, `/schedule create`, and `/settings` provide guided forms. `/task add` and `/schedule add` also open forms when their main arguments are omitted. Settings save explicit notification choices, privacy options, and timezone together.
+- Right-click a message → **Apps → Create task** or **Remind me about this** to save it with a link to the original. Access to that message still depends on Discord permissions.
+- `/study start` defaults to private controls. The session continues after the 15-minute private card expires; reopen `/study status` for fresh controls. `/study timer` or `/study start delivery:dm` sends a lasting DM card. DM session controls and group lobby buttons recover their saved identities after restart, and old cards cannot operate on replacement sessions.
+- `/remind at` uses Discord's date/time picker. New weekly blocks and text reminders use each user's IANA timezone from `/settings`, defaulting to the deployment's `TIMEZONE`. Existing blocks retain the deployment timezone during migration and keep their saved timezone when preferences change. Recurring blocks skip nonexistent daylight-saving times and fire once at the first occurrence of a repeated hour. Daily goals and reset boundaries still use the deployment calendar, US Eastern by default.
+- `/study_plan event` creates a native scheduled study event with RSVPs, optionally in a voice channel. Start `/group_pomo` when it begins; events do not automatically start timers. `/study_plan poll` posts native polls for subjects or meeting times. Both are server-only and check Discord permissions.
+
+Productivity commands support server and user installs and private contexts. Administration, group Pomodoro, study planning, and server RPG commands declare server-only scopes while retaining runtime authorization checks. Database operations run on a serialized worker thread to keep disk work off Discord's event loop.
 
 ## Study and planning
 
@@ -86,21 +99,21 @@ Setup was checked with Python 3.12. Use a fresh environment rather than copying 
 ```powershell
 git clone https://github.com/chentaot1/StudyBot.git
 cd StudyBot
-py -3.12 -m venv venv
-.\venv\Scripts\python.exe -m pip install -r requirements-lock.txt
+py -3.12 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements-lock.txt
 Copy-Item .env.example .env
 ```
 
-On Linux or macOS, create the environment with `python3.12 -m venv venv`, then use `venv/bin/python` for the equivalent install and run commands.
+On Linux or macOS, create the environment with `python3.12 -m venv .venv`, then use `.venv/bin/python` for the equivalent install and run commands.
 
-Create a Discord application and bot in the [Discord Developer Portal](https://discord.com/developers/applications). Enable the **Server Members Intent** and **Message Content Intent**, which the code requests. Install the bot in your server with the `bot` and `applications.commands` scopes. Give it the permissions needed for the features you use, including reading and sending messages, embeds and attachments, message history, and reactions. The optional reaction-role feature also needs Manage Roles and a bot role above the announcement role.
+Create a Discord application and bot in the [Discord Developer Portal](https://discord.com/developers/applications). Enable the **Server Members Intent**, which the membership policy requires. The bot does not request Message Content Intent. Selected messages are supplied through Discord message context actions. Install the bot in your server with the `bot` and `applications.commands` scopes. Give it the permissions needed for the features you use, including reading and sending messages, embeds and attachments, message history, and reactions. The optional reaction-role feature also needs Manage Roles and a bot role above the announcement role. Study events and polls need Create Events and Send Polls permissions in the intended channels. Enable user installation in the application settings if you want user-installed productivity commands.
 
 Edit `.env` locally:
 
 - `DISCORD_TOKEN`: your bot token.
 - `OWNER_ID`: the Discord user ID allowed to use owner administration commands.
 - `ALLOWED_GUILD_IDS`: the server IDs for this deployment, separated by commas. At least one is required before connecting.
-- `TIMEZONE`: an IANA timezone name; defaults to `America/New_York`. Some existing command labels still refer to Eastern time.
+- `TIMEZONE`: an IANA timezone name; defaults to `America/New_York`. It defines reset boundaries and the default for user schedule/reminder preferences. Some existing labels still refer to Eastern time.
 - `DB_PATH` and `LOG_DIR`: local database and log locations. Relative paths are resolved from the directory where you start the bot.
 - `LITE_USER_IDS`: optional productivity-only user IDs.
 - `DUO_LEADERBOARD_USER_IDS`: optional IDs for the private duo board, in display order.
@@ -116,16 +129,22 @@ The example configuration sets `SYNC_GUILD_COMMANDS=true` to register commands i
 For supported commands in DMs, set `SYNC_COMMANDS=true` for a boot to register global commands, or use `SYNC_GLOBAL_COMMAND_SYNC=true` alongside guild sync. RPG commands have separate server-only gates. User-install support also depends on the application's Discord installation settings. Guild-only registration does not make commands available in DMs.
 
 ```powershell
-.\venv\Scripts\python.exe bot.py
+.\.venv\Scripts\python.exe bot.py
 ```
 
 Open `/tutorial` for the detailed guide or `/help` for commands. Common starting points are `/study start`, `/pomodoro start`, `/group_pomo start`, `/task add`, `/schedule add`, and `/today`. `/source` provides the configured source link and license.
 
 GitHub hosts the code. You still need a computer or server running the bot and a Discord application of your own.
 
+### Updating an existing deployment
+
+Stop the existing bot before switching environments. Back up its database before the first upgraded start; schema changes are additive and run at startup. Copying a live SQLite database also requires its `-wal` and `-shm` files. Keep your existing `.env` and database out of Git.
+
+On Windows, `setup.ps1 -Python "C:\path\to\python.exe"` builds `.venv` from the lock file. The watchdog and NSSM setup scripts now prefer `.venv` and reject broken environments. If an existing service points directly to an older interpreter, update its configuration before restarting it. Run only one instance for a deployment. Re-enable the command sync settings for one boot to publish the new commands; global command changes may take time to propagate.
+
 ## Verification
 
-StudyBot is a working, self-hosted Discord bot. Automated checks passed **53 tests**, the structural smoke check, a small database simulation, and an offline startup that loaded all 20 feature modules.
+StudyBot is a working, self-hosted Discord bot. Automated checks passed **76 tests**, the structural smoke check, a small database simulation, and an offline startup that loaded all 21 feature modules.
 
 Recorded time and focus ratings are user-reported signals. Adaptive goal suggestions are rule-based, and no AI service is required. The bot is self-hosted: the operator controls its database and credentials, and Discord carries the messages and interactions.
 
@@ -134,12 +153,12 @@ Recorded time and focus ratings are user-reported signals. Adaptive goal suggest
 Run from the repository root in the configured environment:
 
 ```powershell
-.\venv\Scripts\python.exe -m pytest -q
-.\venv\Scripts\python.exe smoke_check.py
-.\venv\Scripts\python.exe scripts/db_sim_test.py
+.\.venv\Scripts\python.exe -m pytest -q
+.\.venv\Scripts\python.exe smoke_check.py
+.\.venv\Scripts\python.exe scripts/db_sim_test.py
 ```
 
-The tests create temporary databases. The smoke check parses application code and checks structural contracts; the database simulation exercises a small outbox flow without connecting to Discord. `scripts/bug_finder.py --lane outbox` runs the focused outbox test lane.
+The tests create temporary databases and mock Discord interactions. They cover legacy schema migration, timezones and daylight saving, duplicate submissions, stale controls, private/DM timer editing, native planning permissions, and command scopes. The offline bootstrap does not log in or sync with Discord. The smoke check parses application code and checks structural contracts; the database simulation exercises a small outbox flow without connecting to Discord. `scripts/bug_finder.py --lane outbox` runs the focused outbox test lane.
 
 `requirements.txt` describes the dependency ranges. `requirements-lock.txt` records the dependency versions used for the automated checks.
 
@@ -150,9 +169,9 @@ The tests create temporary databases. The smoke check parses application code an
 - `database.py`: SQLite schema, migrations, and persistence operations.
 - `services/rewards_engine.py`: reward calculations shared by study and Pomodoro paths.
 - `constants.py` and `env_config.py`: balance values and deployment settings.
-- `views/`: onboarding controls; `utils.py` and `temptation_bundle.py`: shared helpers.
+- `views/`: dashboards, forms, persistent controls, and onboarding; `utils.py` and `temptation_bundle.py`: shared helpers.
 - `tests/`, `smoke_check.py`, and `scripts/`: regression and diagnostic checks.
-- `run_forever.ps1` and `install_nssm_service.ps1`: optional Windows supervision.
+- `setup.ps1`, `run_forever.ps1`, and `install_nssm_service.ps1`: environment setup and optional Windows supervision.
 
 ## License
 

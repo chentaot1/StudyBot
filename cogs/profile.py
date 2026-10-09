@@ -54,8 +54,8 @@ class Profile(commands.Cog):
         target = user or interaction.user
         uid = target.id
         is_lite = getattr(self.bot, "is_lite_user", lambda _uid: False)(uid)
-        self.bot.db.ensure_user(uid, target.display_name)
-        data = self.bot.db.get_user(uid)
+        (await self.bot.db_worker.run(lambda: self.bot.db.ensure_user(uid, target.display_name)))
+        data = (await self.bot.db_worker.run(lambda: self.bot.db.get_user(uid)))
         if not data:
             await interaction.response.send_message("User not found.", ephemeral=True)
             return
@@ -66,7 +66,7 @@ class Profile(commands.Cog):
         xp_needed = xp_for_level(level) if level < MAX_LEVEL else 0
         coins = data.get("coins", 0)
         streak = data.get("streak", 0)
-        total_mins = self.bot.db.get_total_study_minutes(uid)
+        total_mins = (await self.bot.db_worker.run(lambda: self.bot.db.get_total_study_minutes(uid)))
         seasonal_mins = data.get("seasonal_minutes", 0)
         seasonal_rank = seasonal_rank_for_minutes(seasonal_mins)
 
@@ -80,7 +80,7 @@ class Profile(commands.Cog):
             title=" ".join(title_parts),
             color=int(data["role_color_hex"], 16) if data.get("role_color_hex") else COLOR_PRIMARY
         )
-        inv = self.bot.db.get_inventory(uid)
+        inv = (await self.bot.db_worker.run(lambda: self.bot.db.get_inventory(uid)))
         has_lb_icon = any(
             it.get("item_type") == "cosmetic" and it.get("item_key") == "lb_icon"
             for it in inv
@@ -106,7 +106,7 @@ class Profile(commands.Cog):
             embed.add_field(name="⚔️ Level", value=xp_line, inline=False)
 
         # Freezes
-        freezes = self.bot.db.get_freezes(uid)
+        freezes = (await self.bot.db_worker.run(lambda: self.bot.db.get_freezes(uid)))
         freeze_display = f"{'🧊' * freezes['count']}{'⬜' * (2 - freezes['count'])}" if freezes["count"] > 0 else "None"
 
         embed.add_field(name="🔥 Streak", value=f"**{streak}** days", inline=True)
@@ -118,7 +118,7 @@ class Profile(commands.Cog):
         embed.add_field(name="🏅 Season", value=f"{seasonal_rank} ({fmt_mins(seasonal_mins)})", inline=True)
 
         # Featured badges
-        featured = self.bot.db.get_featured_badges(uid)
+        featured = (await self.bot.db_worker.run(lambda: self.bot.db.get_featured_badges(uid)))
         if featured:
             badge_names = []
             for bk in featured:
@@ -146,8 +146,8 @@ class Profile(commands.Cog):
         for uid in ids:
             u = await getattr(self.bot, "get_user_or_fetch", lambda _uid: None)(uid)
             display = u.display_name if u else f"User {uid}"
-            self.bot.db.ensure_user(uid, display)
-            row = self.bot.db.get_user(uid) or {"user_id": uid, "username": display}
+            (await self.bot.db_worker.run(lambda: self.bot.db.ensure_user(uid, display)))
+            row = (await self.bot.db_worker.run(lambda: self.bot.db.get_user(uid))) or {"user_id": uid, "username": display}
             if not row.get("username"):
                 row["username"] = display
             users[uid] = row
@@ -163,7 +163,7 @@ class Profile(commands.Cog):
                 "seasonal_mins": int((users[uid].get("seasonal_minutes") or 0)),
             }
 
-        stats = {uid: _stat(uid) for uid in ids}
+        stats = await self.bot.db_worker.run(lambda: {uid: _stat(uid) for uid in ids})
 
         def _winner_label(key: str, higher_is_better: bool = True) -> int | None:
             a, b = ids[0], ids[1]
@@ -245,11 +245,11 @@ class Profile(commands.Cog):
             return
         # Raid leaderboard uses the active boss context rather than lifetime totals.
         if category == "raid":
-            boss = self.bot.db.get_active_boss()
+            boss = (await self.bot.db_worker.run(lambda: self.bot.db.get_active_boss()))
             if not boss:
                 await interaction.response.send_message("No active raid boss.", ephemeral=True)
                 return
-            lb = self.bot.db.get_raid_leaderboard(boss["id"], limit=15)
+            lb = (await self.bot.db_worker.run(lambda: self.bot.db.get_raid_leaderboard(boss["id"], limit=15)))
             if not lb:
                 await interaction.response.send_message("No damage dealt yet!", ephemeral=True)
                 return
@@ -266,7 +266,7 @@ class Profile(commands.Cog):
             await interaction.response.send_message(embed=embed, ephemeral=True)
             return
 
-        lb = self.bot.db.get_leaderboard(category, limit=15)
+        lb = (await self.bot.db_worker.run(lambda: self.bot.db.get_leaderboard(category, limit=15)))
         if not lb:
             await interaction.response.send_message("No data for this leaderboard yet.", ephemeral=True)
             return
@@ -307,9 +307,10 @@ class Profile(commands.Cog):
 
     @app_commands.command(name="settings", description="Configure your StudyBot settings")
     async def settings_cmd(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
         uid = interaction.user.id
-        self.bot.db.ensure_user(uid, interaction.user.display_name)
-        user = self.bot.db.get_user(uid)
+        (await self.bot.db_worker.run(lambda: self.bot.db.ensure_user(uid, interaction.user.display_name)))
+        user = (await self.bot.db_worker.run(lambda: self.bot.db.get_user(uid)))
 
         embed = discord.Embed(title="⚙️ Settings", color=COLOR_PRIMARY)
 
@@ -321,13 +322,17 @@ class Profile(commands.Cog):
 
         dm_lines = []
         for key, label in DM_TOGGLES.items():
-            enabled = self.bot.db.get_dm_enabled(uid, key)
+            enabled = (await self.bot.db_worker.run(lambda: self.bot.db.get_dm_enabled(uid, key)))
             status = "✅" if enabled else "❌"
             dm_lines.append(f"{status} {label}")
         embed.add_field(name="📬 DM Notifications", value="\n".join(dm_lines), inline=False)
 
-        view = SettingsView(self.bot, uid)
-        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+        from views.forms import PreferencesView
+        from services.scheduling import DEFAULT_TIMEZONE
+        zone = await self.bot.db_worker.run(self.bot.db.get_setting, uid, "timezone", DEFAULT_TIMEZONE)
+        embed.add_field(name="Timezone", value=zone, inline=False)
+        view = PreferencesView(self.bot, uid)
+        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
 
 class SettingsView(discord.ui.View):
@@ -340,9 +345,9 @@ class SettingsView(discord.ui.View):
     async def toggle_ghost(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id != self.user_id:
             return
-        user = self.bot.db.get_user(self.user_id)
+        user = (await self.bot.db_worker.run(lambda: self.bot.db.get_user(self.user_id)))
         new_val = 0 if user.get("ghost_mode") else 1
-        self.bot.db.set_ghost_mode(self.user_id, bool(new_val))
+        (await self.bot.db_worker.run(lambda: self.bot.db.set_ghost_mode(self.user_id, bool(new_val))))
         status = "enabled" if new_val else "disabled"
         await interaction.response.send_message(f"👻 Ghost Mode **{status}**.", ephemeral=True)
 
@@ -350,9 +355,9 @@ class SettingsView(discord.ui.View):
     async def toggle_cheers(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id != self.user_id:
             return
-        user = self.bot.db.get_user(self.user_id)
+        user = (await self.bot.db_worker.run(lambda: self.bot.db.get_user(self.user_id)))
         new_val = 0 if user.get("block_cheers") else 1
-        self.bot.db.set_block_cheers(self.user_id, bool(new_val))
+        (await self.bot.db_worker.run(lambda: self.bot.db.set_block_cheers(self.user_id, bool(new_val))))
         status = "blocked" if new_val else "allowed"
         await interaction.response.send_message(f"📣 Cheers now **{status}**.", ephemeral=True)
 
@@ -364,9 +369,9 @@ class SettingsView(discord.ui.View):
         if interaction.user.id != self.user_id:
             return
         key = select.values[0]
-        current = self.bot.db.get_dm_enabled(self.user_id, key)
+        current = (await self.bot.db_worker.run(lambda: self.bot.db.get_dm_enabled(self.user_id, key)))
         new_val = "0" if current else "1"
-        self.bot.db.set_setting(self.user_id, f"dm_{key}", new_val)
+        (await self.bot.db_worker.run(lambda: self.bot.db.set_setting(self.user_id, f"dm_{key}", new_val)))
         label = DM_TOGGLES.get(key, key)
         status = "enabled" if new_val == "1" else "disabled"
         await interaction.response.send_message(f"📬 **{label}** notifications **{status}**.", ephemeral=True)

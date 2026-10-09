@@ -25,10 +25,10 @@ class Shop(commands.Cog):
         if cog:
             await cog.check_economy_badges(user_id)
 
-    def _get_potion_params(self, user_id: int, potion_key: str) -> dict:
+    async def _get_potion_params(self, user_id: int, potion_key: str) -> dict:
         """Apply prestige modifiers to a potion."""
         base = POTION_CATALOG[potion_key].copy()
-        perks = self.bot.db.get_prestige_perks(user_id)
+        perks = (await self.bot.db_worker.run(lambda: self.bot.db.get_prestige_perks(user_id)))
         if "time_lord" in perks:
             base["hours"] *= 2
         if "master_alchemist" in perks:
@@ -41,16 +41,16 @@ class Shop(commands.Cog):
             await interaction.response.send_message("Lite mode: RPG/economy features are disabled for your account.", ephemeral=True)
             return
         uid = interaction.user.id
-        self.bot.db.ensure_user(uid, interaction.user.display_name)
-        user = self.bot.db.get_user(uid)
-        perks = self.bot.db.get_prestige_perks(uid)
+        (await self.bot.db_worker.run(lambda: self.bot.db.ensure_user(uid, interaction.user.display_name)))
+        user = (await self.bot.db_worker.run(lambda: self.bot.db.get_user(uid)))
+        perks = (await self.bot.db_worker.run(lambda: self.bot.db.get_prestige_perks(uid)))
 
         embed = discord.Embed(title="🛒 StudyBot Shop", color=0xE67E22)
         embed.description = f"💎 **{user['points']:,}** pts  •  🪙 **{user['coins']}** coins"
 
         potion_lines = []
         for key, p in POTION_CATALOG.items():
-            mod = self._get_potion_params(uid, key)
+            mod = (await self._get_potion_params(uid, key))
             cost = f"{p['cost_pts']:,} pts" if p['cost_pts'] else f"{p['cost_coins']}c"
             potion_lines.append(f"**{mod['name']}** — {cost} — {mod['mult']}x XP / {mod['hours']}h")
         potion_lines.append(
@@ -103,9 +103,9 @@ class Shop(commands.Cog):
         uid = interaction.user.id
         await interaction.response.defer(ephemeral=True)
         async with self.bot.user_locks[uid]:
-            self.bot.db.ensure_user(uid, interaction.user.display_name)
+            (await self.bot.db_worker.run(lambda: self.bot.db.ensure_user(uid, interaction.user.display_name)))
             g = GACHA_TIERS[tier]
-            if not self.bot.db.remove_coins(uid, g["cost"]):
+            if not (await self.bot.db_worker.run(lambda: self.bot.db.remove_coins(uid, g["cost"]))):
                 await interaction.followup.send(
                     f"Not enough coins! You need **{g['cost']}c** for a {tier} pull.",
                     ephemeral=True
@@ -125,8 +125,8 @@ class Shop(commands.Cog):
                 result = random.randint(*g["profit_range"])
                 outcome = "profit"
 
-            self.bot.db.add_points(uid, result, reason=f"Gacha {tier}", track_earned=False)
-            self.bot.db.record_gacha(uid, tier, g["cost"], result, is_jackpot)
+            (await self.bot.db_worker.run(lambda: self.bot.db.add_points(uid, result, reason=f"Gacha {tier}", track_earned=False)))
+            (await self.bot.db_worker.run(lambda: self.bot.db.record_gacha(uid, tier, g["cost"], result, is_jackpot)))
 
             badge_cog = self.bot.cogs.get("Badges")
             if badge_cog:
@@ -143,7 +143,7 @@ class Shop(commands.Cog):
                 embed = discord.Embed(title="🎰 Better Luck Next Time", color=0xE74C3C)
                 embed.description = f"**{tier.title()} Gacha** — You got **+{result:,} pts** (cost: {g['cost']}c)"
 
-            user = self.bot.db.get_user(uid)
+            user = (await self.bot.db_worker.run(lambda: self.bot.db.get_user(uid)))
             embed.add_field(name="Balance", value=f"💎 {user['points']:,} pts  •  🪙 {user['coins']}c", inline=False)
             await interaction.followup.send(embed=embed, ephemeral=True)
 
@@ -162,23 +162,23 @@ class Shop(commands.Cog):
         uid = interaction.user.id
         await interaction.response.defer(ephemeral=True)
         async with self.bot.user_locks[uid]:
-            self.bot.db.ensure_user(uid, interaction.user.display_name)
+            (await self.bot.db_worker.run(lambda: self.bot.db.ensure_user(uid, interaction.user.display_name)))
             if target.id == uid:
                 await interaction.followup.send("You can't bounty yourself!", ephemeral=True)
                 return
-            target_data = self.bot.db.get_user(target.id)
+            target_data = (await self.bot.db_worker.run(lambda: self.bot.db.get_user(target.id)))
             if target_data and target_data.get("ghost_mode"):
                 await interaction.followup.send("That user has Ghost Mode enabled.", ephemeral=True)
                 return
-            self.bot.db.ensure_user(target.id, target.display_name)
+            (await self.bot.db_worker.run(lambda: self.bot.db.ensure_user(target.id, target.display_name)))
             # Target can only have one active bounty at a time (pending or active buff window)
-            if self.bot.db.get_active_bounty(target.id):
+            if (await self.bot.db_worker.run(lambda: self.bot.db.get_active_bounty(target.id))):
                 await interaction.followup.send("That user already has an active bounty. No coins were spent.", ephemeral=True)
                 return
-            if not self.bot.db.remove_coins(uid, 5):
+            if not (await self.bot.db_worker.run(lambda: self.bot.db.remove_coins(uid, 5))):
                 await interaction.followup.send("Not enough coins (5c required).", ephemeral=True)
                 return
-            bounty_id = self.bot.db.create_bounty(uid, target.id, cost_coins=5)
+            bounty_id = (await self.bot.db_worker.run(lambda: self.bot.db.create_bounty(uid, target.id, cost_coins=5)))
 
             embed = discord.Embed(
                 title="📢 Study Bounty Sent!",
@@ -196,8 +196,8 @@ class Shop(commands.Cog):
                 await badge_cog.check_sponsor_badge(uid)
                 await badge_cog.check_economy_badges(uid)
 
-            if self.bot.db.get_dm_enabled(target.id, "bounty_activated"):
-                self.bot.db.enqueue_outbox(
+            if (await self.bot.db_worker.run(lambda: self.bot.db.get_dm_enabled(target.id, "bounty_activated"))):
+                (await self.bot.db_worker.run(lambda: self.bot.db.enqueue_outbox(
                     target_type="user",
                     target_id=target.id,
                     kind="bounty_pending",
@@ -211,7 +211,7 @@ class Shop(commands.Cog):
                         ),
                         "color": 0xE67E22,
                     },
-                )
+                )))
 
     @app_commands.command(name="beacon", description="Activate The Beacon (10c) — 1.5x raid dmg + 200 pts/hr for 2h")
     @app_commands.checks.cooldown(1, 10.0)
@@ -222,16 +222,16 @@ class Shop(commands.Cog):
         uid = interaction.user.id
         await interaction.response.defer(ephemeral=True)
         async with self.bot.user_locks[uid]:
-            self.bot.db.ensure_user(uid, interaction.user.display_name)
-            perks = self.bot.db.get_prestige_perks(uid)
+            (await self.bot.db_worker.run(lambda: self.bot.db.ensure_user(uid, interaction.user.display_name)))
+            perks = (await self.bot.db_worker.run(lambda: self.bot.db.get_prestige_perks(uid)))
             duration = 4 if "time_lord" in perks else 2
 
-            if not self.bot.db.remove_coins(uid, 10):
+            if not (await self.bot.db_worker.run(lambda: self.bot.db.remove_coins(uid, 10))):
                 await interaction.followup.send("Not enough coins (10c required).", ephemeral=True)
                 return
 
             channel_id = interaction.channel_id if interaction.channel else 0
-            self.bot.db.create_beacon(uid, channel_id, duration)
+            (await self.bot.db_worker.run(lambda: self.bot.db.create_beacon(uid, channel_id, duration)))
 
             embed = discord.Embed(
                 title="🔥 The Beacon is Lit!",
@@ -243,7 +243,7 @@ class Shop(commands.Cog):
         # Announcement to configured beacon channel (server-only)
         try:
             if interaction.guild_id:
-                announce_ch_id = self.bot.db.get_channel(interaction.guild_id, "beacon")
+                announce_ch_id = (await self.bot.db_worker.run(lambda: self.bot.db.get_channel(interaction.guild_id, "beacon")))
                 if announce_ch_id:
                     ch = self.bot.get_channel(announce_ch_id)
                     if ch:
@@ -299,24 +299,24 @@ class ShopView(discord.ui.View):
         choice = select.values[0]
 
         async with self.bot.user_locks[uid]:
-            user = self.bot.db.get_user(uid)
-            perks = self.bot.db.get_prestige_perks(uid)
+            user = (await self.bot.db_worker.run(lambda: self.bot.db.get_user(uid)))
+            perks = (await self.bot.db_worker.run(lambda: self.bot.db.get_prestige_perks(uid)))
             shop_cog = self.shop
 
             if choice in POTION_CATALOG:
                 cat = POTION_CATALOG[choice]
-                params = shop_cog._get_potion_params(uid, choice) if shop_cog else cat
+                params = (await shop_cog._get_potion_params(uid, choice)) if shop_cog else cat
 
                 if cat["cost_pts"] > 0:
-                    if not self.bot.db.deduct_points(uid, cat["cost_pts"]):
+                    if not (await self.bot.db_worker.run(lambda: self.bot.db.deduct_points(uid, cat["cost_pts"]))):
                         await interaction.followup.send("Not enough points!", ephemeral=True)
                         return
                 elif cat["cost_coins"] > 0:
-                    if not self.bot.db.remove_coins(uid, cat["cost_coins"]):
+                    if not (await self.bot.db_worker.run(lambda: self.bot.db.remove_coins(uid, cat["cost_coins"]))):
                         await interaction.followup.send("Not enough coins!", ephemeral=True)
                         return
 
-                _, extended = self.bot.db.activate_potion(uid, f"potion_{choice}", params["mult"], params["hours"])
+                _, extended = (await self.bot.db_worker.run(lambda: self.bot.db.activate_potion(uid, f"potion_{choice}", params["mult"], params["hours"])))
                 verb = "Time extended!" if extended else "Activated!"
                 embed = discord.Embed(
                     title=f"🧪 {params['name']} — {verb}",
@@ -325,7 +325,7 @@ class ShopView(discord.ui.View):
                 )
                 await interaction.edit_original_response(embed=embed, view=None)
                 await shop_cog.notify_economy_badges(uid)
-                u2 = self.bot.db.get_user(uid)
+                u2 = (await self.bot.db_worker.run(lambda: self.bot.db.get_user(uid)))
                 if u2 and int(u2.get("coins") or 0) == 0:
                     badge_cog = self.bot.cogs.get("Badges")
                     if badge_cog:
@@ -336,15 +336,15 @@ class ShopView(discord.ui.View):
                 if now.weekday() >= 5:
                     await interaction.followup.send("Emergency Save can only be used Mon-Fri.", ephemeral=True)
                     return
-                freezes = self.bot.db.get_freezes(uid)
+                freezes = (await self.bot.db_worker.run(lambda: self.bot.db.get_freezes(uid)))
                 if freezes["count"] > 0:
                     await interaction.followup.send("Your freeze bank must be 0 to buy this.", ephemeral=True)
                     return
                 cost = 2 if "resilient" in perks else 3
-                if not self.bot.db.remove_coins(uid, cost):
+                if not (await self.bot.db_worker.run(lambda: self.bot.db.remove_coins(uid, cost))):
                     await interaction.followup.send(f"Not enough coins ({cost}c required).", ephemeral=True)
                     return
-                self.bot.db.add_freeze(uid)
+                (await self.bot.db_worker.run(lambda: self.bot.db.add_freeze(uid)))
                 embed = discord.Embed(
                     title="🛡️ Emergency Save Purchased!",
                     description="**+1 Streak Freeze** added to your bank.",
@@ -352,7 +352,7 @@ class ShopView(discord.ui.View):
                 )
                 await interaction.edit_original_response(embed=embed, view=None)
                 await shop_cog.notify_economy_badges(uid)
-                u2 = self.bot.db.get_user(uid)
+                u2 = (await self.bot.db_worker.run(lambda: self.bot.db.get_user(uid)))
                 if u2 and int(u2.get("coins") or 0) == 0:
                     badge_cog = self.bot.cogs.get("Badges")
                     if badge_cog:
@@ -360,10 +360,10 @@ class ShopView(discord.ui.View):
 
             elif choice in COSMETIC_COSTS:
                 cost = COSMETIC_COSTS[choice]
-                if not self.bot.db.remove_coins(uid, cost):
+                if not (await self.bot.db_worker.run(lambda: self.bot.db.remove_coins(uid, cost))):
                     await interaction.followup.send(f"Not enough coins ({cost}c required).", ephemeral=True)
                     return
-                self.bot.db.add_inventory_item(uid, "cosmetic", choice)
+                (await self.bot.db_worker.run(lambda: self.bot.db.add_inventory_item(uid, "cosmetic", choice)))
                 desc = f"**{choice.replace('_', ' ').title()}** added to your inventory!"
                 if choice == "lb_icon":
                     desc += "\n\nUse **`/profile`** — your Discord avatar shows as the card thumbnail."
@@ -374,7 +374,7 @@ class ShopView(discord.ui.View):
                 )
                 await interaction.edit_original_response(embed=embed, view=None)
                 await shop_cog.notify_economy_badges(uid)
-                u2 = self.bot.db.get_user(uid)
+                u2 = (await self.bot.db_worker.run(lambda: self.bot.db.get_user(uid)))
                 if u2 and int(u2.get("coins") or 0) == 0:
                     badge_cog = self.bot.cogs.get("Badges")
                     if badge_cog:

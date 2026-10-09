@@ -28,7 +28,7 @@ class Raid(commands.Cog):
 
     async def handle_boss_cycle(self):
         """Called every Monday at midnight by the scheduler."""
-        boss = self.bot.db.get_active_boss()
+        boss = (await self.bot.db_worker.run(lambda: self.bot.db.get_active_boss()))
 
         if boss:
             ends = parse_stored(boss["ends_at"])
@@ -38,25 +38,25 @@ class Raid(commands.Cog):
             else:
                 return
 
-        last_boss = self._get_last_boss()
+        last_boss = (await self._get_last_boss())
         if last_boss:
-            next_hp = self.bot.db.calculate_next_boss_hp(last_boss)
+            next_hp = (await self.bot.db_worker.run(lambda: self.bot.db.calculate_next_boss_hp(last_boss)))
         else:
             next_hp = SEED_HP
 
-        self._spawn_new_boss(next_hp)
+        (await self._spawn_new_boss(next_hp))
 
-    def _get_last_boss(self):
-        return self.bot.db.get_last_ended_boss()
+    async def _get_last_boss(self):
+        return (await self.bot.db_worker.run(lambda: self.bot.db.get_last_ended_boss()))
 
-    def _spawn_new_boss(self, hp: int):
-        boss = self.bot.db.spawn_boss(hp)
+    async def _spawn_new_boss(self, hp: int):
+        boss = (await self.bot.db_worker.run(lambda: self.bot.db.spawn_boss(hp)))
         log.info(f"Spawned raid boss #{boss['id']} with {hp} HP")
         asyncio.create_task(self._announce_boss(boss))
 
     async def broadcast_daily_progress(self):
         """Post current boss HP to each guild's raid (or general) channel — scheduled once daily."""
-        boss = self.bot.db.get_active_boss()
+        boss = (await self.bot.db_worker.run(lambda: self.bot.db.get_active_boss()))
         if not boss:
             return
 
@@ -78,9 +78,9 @@ class Raid(commands.Cog):
         embed.set_footer(text="Use /raid for your stats • /raid_leaderboard for rankings")
 
         for guild in self.bot.guilds:
-            channel_id = self.bot.db.get_channel(guild.id, "raid")
+            channel_id = (await self.bot.db_worker.run(lambda: self.bot.db.get_channel(guild.id, "raid")))
             if not channel_id:
-                channel_id = self.bot.db.get_channel(guild.id, "general")
+                channel_id = (await self.bot.db_worker.run(lambda: self.bot.db.get_channel(guild.id, "general")))
             if not channel_id:
                 continue
             channel = self.bot.get_channel(channel_id)
@@ -97,9 +97,9 @@ class Raid(commands.Cog):
 
     async def _announce_boss(self, boss: dict):
         for guild in self.bot.guilds:
-            channel_id = self.bot.db.get_channel(guild.id, "raid")
+            channel_id = (await self.bot.db_worker.run(lambda: self.bot.db.get_channel(guild.id, "raid")))
             if not channel_id:
-                channel_id = self.bot.db.get_channel(guild.id, "general")
+                channel_id = (await self.bot.db_worker.run(lambda: self.bot.db.get_channel(guild.id, "general")))
             if not channel_id:
                 continue
             channel = self.bot.get_channel(channel_id)
@@ -124,13 +124,13 @@ class Raid(commands.Cog):
                 log.debug("Raid boss announce failed (guild=%s, channel=%s): %s", guild.id, channel_id, e)
 
     async def _resolve_boss(self, boss: dict):
-        boss = self.bot.db.end_boss(boss["id"])
+        boss = (await self.bot.db_worker.run(lambda: self.bot.db.end_boss(boss["id"])))
         if not boss:
             return
 
         killed = boss["killed"]
-        lb = self.bot.db.get_raid_leaderboard(boss["id"], limit=20)
-        participants = self.bot.db.get_raid_participants(boss["id"], min_damage=60)
+        lb = (await self.bot.db_worker.run(lambda: self.bot.db.get_raid_leaderboard(boss["id"], limit=20)))
+        participants = (await self.bot.db_worker.run(lambda: self.bot.db.get_raid_participants(boss["id"], min_damage=60)))
 
         # Podium rewards
         podium_rewards = [
@@ -144,13 +144,13 @@ class Raid(commands.Cog):
             if idx < len(lb):
                 entry = lb[idx]
                 uid = entry["user_id"]
-                self.bot.db.add_coins(uid, coins)
-                self.bot.db.add_xp(uid, xp)
+                (await self.bot.db_worker.run(lambda: self.bot.db.add_coins(uid, coins)))
+                (await self.bot.db_worker.run(lambda: self.bot.db.add_xp(uid, xp)))
                 awarded.append(f"{label}: <@{uid}> ({entry['raw_damage']:,} dmg) — +{coins}c +{xp:,} XP")
 
         if not killed and lb:
             mvp = lb[0]
-            self.bot.db.add_coins(mvp["user_id"], 1)
+            (await self.bot.db_worker.run(lambda: self.bot.db.add_coins(mvp["user_id"], 1)))
             awarded.append(f"🏅 MVP (Pity): <@{mvp['user_id']}> — +1c")
             badge_cog = self.bot.cogs.get("Badges")
             if badge_cog:
@@ -161,41 +161,41 @@ class Raid(commands.Cog):
 
         for p in participants:
             uid = p["user_id"]
-            scav = "scavenger" in self.bot.db.get_prestige_perks(uid)
+            scav = "scavenger" in (await self.bot.db_worker.run(lambda: self.bot.db.get_prestige_perks(uid)))
             if uid in top3_ids:
                 if scav:
-                    self._roll_participation(uid, boss, rolls=1)
+                    (await self._roll_participation(uid, boss, rolls=1))
             else:
-                self._roll_participation(uid, boss, rolls=2 if scav else 1)
+                (await self._roll_participation(uid, boss, rolls=2 if scav else 1))
 
         # P2 Scavenger: podium + <60 dmg edge case — still get 1 participation roll
         for i in range(min(3, len(lb))):
             uid = lb[i]["user_id"]
             if uid in participant_uids:
                 continue
-            if "scavenger" not in self.bot.db.get_prestige_perks(uid):
+            if "scavenger" not in (await self.bot.db_worker.run(lambda: self.bot.db.get_prestige_perks(uid))):
                 continue
-            self._roll_participation(uid, boss, rolls=1)
+            (await self._roll_participation(uid, boss, rolls=1))
 
         badge_cog = self.bot.cogs.get("Badges")
         if badge_cog:
             for i in range(min(3, len(lb))):
                 await badge_cog.check_mvp_podium_finish(lb[i]["user_id"])
             if killed:
-                for uid in self.bot.db.get_raid_damage_user_ids(boss["id"]):
+                for uid in (await self.bot.db_worker.run(lambda: self.bot.db.get_raid_damage_user_ids(boss["id"]))):
                     await badge_cog.check_raid_badges(uid, {"killed": True})
 
         await self._announce_result(boss, awarded, lb[:5])
 
-    def _roll_participation(self, user_id: int, boss: dict, rolls: int = 1):
+    async def _roll_participation(self, user_id: int, boss: dict, rolls: int = 1):
         for _ in range(rolls):
             roll = random.randint(1, 100)
             if roll <= 50:
-                self.bot.db.add_xp(user_id, 300)
+                (await self.bot.db_worker.run(lambda: self.bot.db.add_xp(user_id, 300)))
             elif roll <= 85:
-                self.bot.db.add_points(user_id, 500, reason="Raid participation")
+                (await self.bot.db_worker.run(lambda: self.bot.db.add_points(user_id, 500, reason="Raid participation")))
             else:
-                self.bot.db.add_coins(user_id, 1)
+                (await self.bot.db_worker.run(lambda: self.bot.db.add_coins(user_id, 1)))
 
     async def _announce_result(self, boss: dict, awarded: list, top5: list):
         killed = boss["killed"]
@@ -221,9 +221,9 @@ class Raid(commands.Cog):
             embed.add_field(name="📊 Top Damage", value="\n".join(lines), inline=False)
 
         for guild in self.bot.guilds:
-            channel_id = self.bot.db.get_channel(guild.id, "raid")
+            channel_id = (await self.bot.db_worker.run(lambda: self.bot.db.get_channel(guild.id, "raid")))
             if not channel_id:
-                channel_id = self.bot.db.get_channel(guild.id, "general")
+                channel_id = (await self.bot.db_worker.run(lambda: self.bot.db.get_channel(guild.id, "general")))
             if not channel_id:
                 continue
             channel = self.bot.get_channel(channel_id)
@@ -248,8 +248,8 @@ class Raid(commands.Cog):
             return
         uid = interaction.user.id
         await interaction.response.defer(ephemeral=True)
-        self.bot.db.ensure_user(uid, interaction.user.display_name)
-        boss = self.bot.db.get_active_boss()
+        (await self.bot.db_worker.run(lambda: self.bot.db.ensure_user(uid, interaction.user.display_name)))
+        boss = (await self.bot.db_worker.run(lambda: self.bot.db.get_active_boss()))
 
         if not boss:
             await interaction.followup.send("No active raid boss right now. Check back Monday!", ephemeral=True)
@@ -261,7 +261,7 @@ class Raid(commands.Cog):
         days_left = max(remaining.days, 0)
         hours_left = max(remaining.seconds // 3600, 0)
 
-        user_dmg = self.bot.db.get_user_raid_damage(uid, boss["id"])
+        user_dmg = (await self.bot.db_worker.run(lambda: self.bot.db.get_user_raid_damage(uid, boss["id"])))
 
         embed = discord.Embed(title="⚔️ Raid Boss", color=COLOR_RAID)
         embed.add_field(name="HP", value=fmt_hp(boss["hp_remaining"], boss["hp"]), inline=False)
@@ -280,12 +280,12 @@ class Raid(commands.Cog):
             await interaction.response.send_message("Lite mode: RPG features (raids) are disabled for your account.", ephemeral=True)
             return
         await interaction.response.defer(ephemeral=True)
-        boss = self.bot.db.get_active_boss()
+        boss = (await self.bot.db_worker.run(lambda: self.bot.db.get_active_boss()))
         if not boss:
             await interaction.followup.send("No active raid boss.", ephemeral=True)
             return
 
-        lb = self.bot.db.get_raid_leaderboard(boss["id"], limit=15)
+        lb = (await self.bot.db_worker.run(lambda: self.bot.db.get_raid_leaderboard(boss["id"], limit=15)))
         if not lb:
             await interaction.followup.send("No damage dealt yet!", ephemeral=True)
             return

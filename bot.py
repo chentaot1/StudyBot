@@ -24,6 +24,8 @@ from apscheduler.triggers.cron import CronTrigger
 from datetime import datetime, timezone, timedelta
 from constants import EST, COLOR_PRIMARY, COLOR_SUCCESS, COLOR_WARNING, COLOR_MUTED, COLOR_GOLD, USER_NAV_FOOTER, LITE_USER_IDS, SB_PING_ROLE_ID
 from utils import fmt_long_date_us, fmt_mins, fmt_date_us, utcnow, safe_json_loads
+from services.db_worker import DatabaseWorker
+from services.scheduling import due_blocks
 
 from cogs.tutorial import TutorialNavView, _embed as tutorial_chapter_embed, get_help_overview_preamble
 from views.onboarding import OnboardingView
@@ -58,7 +60,7 @@ def _parse_allowed_guild_ids() -> set[int]:
 
 intents = discord.Intents.default()
 intents.members = True
-intents.message_content = True
+intents.message_content = False
 
 if intents.members and intents.message_content:
     log.info("Privileged intents requested. Ensure they are toggled ON in the Discord Developer Portal.")
@@ -102,6 +104,7 @@ class StudyBot(commands.Bot):
         db_path = os.getenv("DB_PATH", "study_bot.db")
         os.makedirs(os.path.dirname(db_path) if os.path.dirname(db_path) else ".", exist_ok=True)
         self.db = Database(db_path)
+        self.db_worker = DatabaseWorker()
         self.scheduler = AsyncIOScheduler(timezone="America/New_York")
         self.owner_id: int = int(os.getenv("OWNER_ID", "0"))
         self.allowed_guild_ids: set[int] | None = _parse_allowed_guild_ids()
@@ -296,18 +299,20 @@ class StudyBot(commands.Bot):
 
     async def setup_hook(self):
         self.state_lock = asyncio.Lock()
-        self.db.initialize()
+        (await self.db_worker.run(lambda: self.db.initialize()))
+        log.info("Runtime Python %s; discord.py %s; database worker enabled", sys.version.split()[0], discord.__version__)
 
         self.tree.on_error = self._on_tree_error
 
         # App command install/context policy.
         #
-        # We allow DM slash commands (requires user-install), but we still hard-block
+        # Bot DMs work with guild installs; user installs also enable other private contexts.
+        # We still hard-block
         # execution in non-allowlisted guilds via the interaction check below.
         try:
             from discord.app_commands import AppInstallationType, AppCommandContext
 
-            # Allow: guild installs + user installs (needed for DM slash commands).
+            # Allow both installation types for productivity commands.
             self.tree.allowed_installs = AppInstallationType(guild=True, user=True)
             # Allow: guild + DMs.
             self.tree.allowed_contexts = AppCommandContext(guild=True, dm_channel=True, private_channel=True)
@@ -433,6 +438,7 @@ class StudyBot(commands.Bot):
             "cogs.profile",
             "cogs.tutorial",
             "cogs.admin",
+            "cogs.planning",
         ]
         for cog in cogs:
             try:
@@ -441,8 +447,16 @@ class StudyBot(commands.Bot):
             except Exception as e:
                 log.error(f"Failed to load {cog}: {e}")
 
+        # Scope root commands/groups before synchronization; runtime authorization stays in place.
+        for command in self.tree.get_commands():
+            if command.name in self.DM_BLOCKED_RPG_ROOT_COMMANDS or command.name in {"admin", "group_pomo", "study_plan"}:
+                command.allowed_contexts = app_commands.AppCommandContext(guild=True, dm_channel=False, private_channel=False)
+                command.allowed_installs = app_commands.AppInstallationType(guild=True, user=False)
+        from views.persistent import StudyControl, GroupControl
+        self.add_dynamic_items(StudyControl, GroupControl)
+
         # Startup self-check: fail loudly if core cogs didn't load.
-        must = ("Study", "Stats", "Admin")
+        must = ("Study", "Stats", "Admin", "Planning")
         missing = [name for name in must if name not in self.cogs]
         if missing:
             log.critical("Core cogs failed to load: %s", ", ".join(missing))
@@ -545,18 +559,18 @@ class StudyBot(commands.Bot):
         """After the user's first successful slash command, show onboarding buttons once."""
         try:
             uid = interaction.user.id
-            self.db.ensure_user(uid, str(interaction.user))
+            (await self.db_worker.run(lambda: self.db.ensure_user(uid, str(interaction.user))))
 
             # Don't nudge inside the nudge itself / obvious entry points.
             cname = getattr(command, "name", "") or ""
             if cname in ("help", "tutorial", "settings"):
                 return
 
-            if self.db.get_setting(uid, "onboarding_seen", "0") == "1":
+            if (await self.db_worker.run(lambda: self.db.get_setting(uid, "onboarding_seen", "0"))) == "1":
                 return
 
             # Mark first so we never spam even if DM/send fails.
-            self.db.set_setting(uid, "onboarding_seen", "1")
+            (await self.db_worker.run(lambda: self.db.set_setting(uid, "onboarding_seen", "1")))
 
             embed = discord.Embed(
                 title="👋 Welcome to StudyBot",
@@ -604,7 +618,7 @@ class StudyBot(commands.Bot):
     # ── Reminder loading ──────────────────────────────────────────────────────
 
     async def _load_reminders(self):
-        reminders = self.db.get_all_pending_reminders()
+        reminders = (await self.db_worker.run(lambda: self.db.get_all_pending_reminders()))
         now = datetime.now(timezone.utc)
         scheduled, late = 0, 0
         for r in reminders:
@@ -613,7 +627,7 @@ class StudyBot(commands.Bot):
                 scheduled += 1
             else:
                 async def _fire_late(reminder=r):
-                    self.db.enqueue_outbox(
+                    (await self.db_worker.run(lambda: self.db.enqueue_outbox(
                         target_type="user",
                         target_id=int(reminder["user_id"]),
                         kind="reminder_late",
@@ -625,8 +639,8 @@ class StudyBot(commands.Bot):
                             "color": int(COLOR_WARNING),
                             "footer": "This reminder fired while the bot was offline.",
                         },
-                    )
-                    self.db.mark_reminder_sent(reminder["id"])
+                    )))
+                    (await self.db_worker.run(lambda: self.db.mark_reminder_sent(reminder["id"])))
                 await asyncio.sleep(0.25)
                 asyncio.create_task(_fire_late())
                 late += 1
@@ -646,7 +660,7 @@ class StudyBot(commands.Bot):
 
     async def _send_reminder(self, reminder_id: int, user_id: int, message: str):
         now_est = datetime.now(EST).strftime("%I:%M %p EST")
-        self.db.enqueue_outbox(
+        (await self.db_worker.run(lambda: self.db.enqueue_outbox(
             target_type="user",
             target_id=int(user_id),
             kind="reminder",
@@ -658,8 +672,8 @@ class StudyBot(commands.Bot):
                 "color": 0x5865F2,
                 "footer": f"StudyBot • {now_est}",
             },
-        )
-        self.db.mark_reminder_sent(reminder_id)
+        )))
+        (await self.db_worker.run(lambda: self.db.mark_reminder_sent(reminder_id)))
 
     # ── Recurring jobs ────────────────────────────────────────────────────────
 
@@ -802,11 +816,11 @@ class StudyBot(commands.Bot):
     async def _pump_outbox(self):
         """Send pending outbox messages. Best-effort; retries on transient failures."""
         try:
-            self.db.requeue_stale_sending_outbox(stale_after_seconds=300)
+            (await self.db_worker.run(lambda: self.db.requeue_stale_sending_outbox(stale_after_seconds=300)))
         except Exception:
             log.debug("Outbox stale requeue failed", exc_info=True)
         try:
-            batch = self.db.claim_outbox_batch(limit=25)
+            batch = (await self.db_worker.run(lambda: self.db.claim_outbox_batch(limit=25)))
         except Exception:
             log.debug("Outbox claim failed", exc_info=True)
             return
@@ -829,24 +843,24 @@ class StudyBot(commands.Bot):
                 try:
                     embed_obj, sb_meta = self._embed_from_outbox_row(embed_json)
                     if embed_obj is None:
-                        self.db.mark_outbox_failed(msg_id, error="bad embed_json")
+                        (await self.db_worker.run(lambda: self.db.mark_outbox_failed(msg_id, error="bad embed_json")))
                         continue
                 except Exception as e:
-                    self.db.mark_outbox_failed(msg_id, error=f"bad embed_json: {e}")
+                    (await self.db_worker.run(lambda: self.db.mark_outbox_failed(msg_id, error=f"bad embed_json: {e}")))
                     continue
 
             # Respect DM toggles at send time (covers "toggle off after enqueue").
             if target_type == "user" and settings_key:
                 try:
-                    if not self.db.get_dm_enabled(target_id, settings_key):
-                        self.db.defer_outbox_later(
+                    if not (await self.db_worker.run(lambda: self.db.get_dm_enabled(target_id, settings_key))):
+                        (await self.db_worker.run(lambda: self.db.defer_outbox_later(
                             msg_id,
                             reason=f"dm disabled: {settings_key}",
                             delay_seconds=3600,
-                        )
+                        )))
                         continue
                 except Exception as e:
-                    self.db.retry_outbox_later(msg_id, error=f"dm gate check failed: {e}", delay_seconds=60)
+                    (await self.db_worker.run(lambda: self.db.retry_outbox_later(msg_id, error=f"dm gate check failed: {e}", delay_seconds=60)))
                     continue
 
             view = None
@@ -862,7 +876,7 @@ class StudyBot(commands.Bot):
                 if target_type == "user":
                     user = await self.get_user_or_fetch(target_id)
                     if not user:
-                        self.db.mark_outbox_failed(msg_id, error="user not found")
+                        (await self.db_worker.run(lambda: self.db.mark_outbox_failed(msg_id, error="user not found")))
                         continue
                     sent = await user.send(content=content, embed=embed_obj, view=view)
                     if view is not None:
@@ -871,22 +885,22 @@ class StudyBot(commands.Bot):
                     ch = self.get_channel(target_id) or await self.fetch_channel(target_id)
                     await ch.send(content=content, embed=embed_obj)
                 else:
-                    self.db.mark_outbox_failed(msg_id, error=f"unknown target_type: {target_type}")
+                    (await self.db_worker.run(lambda: self.db.mark_outbox_failed(msg_id, error=f"unknown target_type: {target_type}")))
                     continue
             except discord.Forbidden:
-                self.db.mark_outbox_failed(msg_id, error="forbidden")
+                (await self.db_worker.run(lambda: self.db.mark_outbox_failed(msg_id, error="forbidden")))
                 continue
             except discord.NotFound:
-                self.db.mark_outbox_failed(msg_id, error="not found")
+                (await self.db_worker.run(lambda: self.db.mark_outbox_failed(msg_id, error="not found")))
                 continue
             except Exception as e:
                 # Exponential-ish backoff, capped.
                 delay = min(15 * (2 ** min(attempts, 5)), 600)
-                self.db.retry_outbox_later(msg_id, error=str(e), delay_seconds=delay)
+                (await self.db_worker.run(lambda: self.db.retry_outbox_later(msg_id, error=str(e), delay_seconds=delay)))
                 continue
 
             try:
-                self.db.mark_outbox_sent(msg_id)
+                (await self.db_worker.run(lambda: self.db.mark_outbox_sent(msg_id)))
             except Exception:
                 log.debug("Outbox mark_sent failed (id=%s)", msg_id, exc_info=True)
             await asyncio.sleep(0.15)
@@ -897,33 +911,33 @@ class StudyBot(commands.Bot):
         try:
             log.info("Daily reset (midnight EST)...")
             async with self.state_lock:
-                self.db.reset_daily_progress()
-                self.db.update_streaks()
-                self._assign_daily_quests()
+                (await self.db_worker.run(lambda: self.db.reset_daily_progress()))
+                (await self.db_worker.run(lambda: self.db.update_streaks()))
+                (await self._assign_daily_quests())
             if self.owner_id:
                 await self._send_morning_briefing(self.owner_id)
                 await self._check_adaptive_goal(self.owner_id)
         except Exception:
             log.exception("Daily reset failed")
 
-    def _assign_daily_quests(self):
+    async def _assign_daily_quests(self):
         try:
             quest_cog = self.cogs.get("Quests")
             if quest_cog:
-                for u in self.db.get_all_users():
-                    quest_cog.assign_quests_for_user(u["user_id"])
+                for u in (await self.db_worker.run(lambda: self.db.get_all_users())):
+                    (await quest_cog.assign_quests_for_user(u["user_id"]))
         except Exception as e:
             log.warning(f"Quest assignment failed: {e}")
 
     async def _send_morning_briefing(self, user_id: int):
         try:
-            user_data = self.db.get_user(user_id)
+            user_data = (await self.db_worker.run(lambda: self.db.get_user(user_id)))
             if not user_data:
                 return
-            pending_tasks = self.db.get_user_tasks(user_id, include_done=False)
-            due_reviews = self.db.get_due_reviews(user_id)
+            pending_tasks = (await self.db_worker.run(lambda: self.db.get_user_tasks(user_id, include_done=False)))
+            due_reviews = (await self.db_worker.run(lambda: self.db.get_due_reviews(user_id)))
             today_name = fmt_long_date_us(datetime.now(EST).date())
-            today_goal = self.db.get_today_goal(user_id)
+            today_goal = (await self.db_worker.run(lambda: self.db.get_today_goal(user_id)))
             date_est = self._est_calendar_date_iso()
 
             embed = discord.Embed(title=f"🌅 Good morning! It's {today_name}", color=0x5865F2)
@@ -951,7 +965,7 @@ class StudyBot(commands.Bot):
                     lines.append(f"_...and {len(regular)-4} more_")
                 embed.add_field(name=f"📋 {len(regular)} Pending Tasks", value="\n".join(lines), inline=False)
 
-            quests = self.db.get_daily_quests(user_id)
+            quests = (await self.db_worker.run(lambda: self.db.get_daily_quests(user_id)))
             if quests:
                 qlines = []
                 for q in quests:
@@ -960,20 +974,20 @@ class StudyBot(commands.Bot):
                 embed.add_field(name="📜 Daily Quests", value="\n".join(qlines), inline=False)
 
             embed.set_footer(text="Let's have a great study day! 📚")
-            self.db.enqueue_outbox(
+            (await self.db_worker.run(lambda: self.db.enqueue_outbox(
                 target_type="user",
                 target_id=int(user_id),
                 kind="morning_briefing",
                 settings_key="morning_briefing",
                 dedupe_key=f"morning_briefing:{int(user_id)}:{date_est}",
                 embed_json=self._outbox_embed_payload(embed),
-            )
+            )))
         except Exception as e:
             log.warning(f"Morning briefing failed: {e}")
 
     async def _check_adaptive_goal(self, user_id: int):
         try:
-            user_data = self.db.get_user(user_id)
+            user_data = (await self.db_worker.run(lambda: self.db.get_user(user_id)))
             if not user_data or not user_data.get("adaptive_goals"):
                 return
             today_est = datetime.now(EST).date().isoformat()
@@ -984,7 +998,7 @@ class StudyBot(commands.Bot):
                 if (datetime.now(EST).date() - last_date).days < 7:
                     return
 
-            hits = self.db.get_goal_hit_streak(user_id, days=7)
+            hits = (await self.db_worker.run(lambda: self.db.get_goal_hit_streak(user_id, days=7)))
             hit_count = sum(1 for h in hits if h)
             current = user_data["daily_goal_minutes"]
 
@@ -1004,14 +1018,14 @@ class StudyBot(commands.Bot):
                 return
 
             emb = discord.Embed(description=msg, color=0x57F287)
-            self.db.enqueue_outbox(
+            (await self.db_worker.run(lambda: self.db.enqueue_outbox(
                 target_type="user",
                 target_id=int(user_id),
                 kind="adaptive_goal_suggestion",
                 dedupe_key=f"adaptive_goal_suggestion:{int(user_id)}:{today_est}",
                 embed_json=self._outbox_embed_payload(emb),
-            )
-            self.db.set_last_goal_suggestion(user_id, today_est)
+            )))
+            (await self.db_worker.run(lambda: self.db.set_last_goal_suggestion(user_id, today_est)))
         except Exception as e:
             log.warning(f"Adaptive goal check failed: {e}")
 
@@ -1023,19 +1037,19 @@ class StudyBot(commands.Bot):
             current_hour = now_est.hour
             today = now_est.date().isoformat()
 
-            users = self.db.get_checkin_users_for_hour(current_hour)
+            users = (await self.db_worker.run(lambda: self.db.get_checkin_users_for_hour(current_hour)))
             for user_data in users:
                 uid = user_data["user_id"]
-                if self.db.get_checkin(uid, today):
+                if (await self.db_worker.run(lambda: self.db.get_checkin(uid, today))):
                     continue
-                today_mins = self.db.get_study_minutes_on_date(uid, today)
+                today_mins = (await self.db_worker.run(lambda: self.db.get_study_minutes_on_date(uid, today)))
                 if today_mins > 0:
-                    self.db.record_checkin(uid, today, studied=True, note="Auto: session recorded")
+                    (await self.db_worker.run(lambda: self.db.record_checkin(uid, today, studied=True, note="Auto: session recorded")))
                     continue
                 date_est = self._est_calendar_date_iso()
                 embed = discord.Embed(title="📋 Evening Check-in", description="Did you study today?", color=0x5865F2)
                 embed.add_field(name="🔥 Streak", value=f"{user_data['streak']} days",        inline=True)
-                embed.add_field(name="🎯 Goal",   value=fmt_mins(self.db.get_today_goal(uid)), inline=True)
+                embed.add_field(name="🎯 Goal",   value=fmt_mins((await self.db_worker.run(lambda: self.db.get_today_goal(uid)))), inline=True)
                 payload = self._outbox_embed_payload(
                     embed,
                     sb={
@@ -1046,14 +1060,14 @@ class StudyBot(commands.Bot):
                     },
                 )
                 try:
-                    self.db.enqueue_outbox(
+                    (await self.db_worker.run(lambda: self.db.enqueue_outbox(
                         target_type="user",
                         target_id=int(uid),
                         kind="evening_checkin",
                         settings_key="evening_checkins",
                         dedupe_key=f"evening_checkin:{int(uid)}:{date_est}",
                         embed_json=payload,
-                    )
+                    )))
                 except Exception as e:
                     log.warning(f"Check-in enqueue failed for {uid}: {e}")
                 await asyncio.sleep(0.05)
@@ -1067,13 +1081,13 @@ class StudyBot(commands.Bot):
             now_est = datetime.now(EST)
             day = now_est.strftime("%A").lower()
             hour, minute = now_est.hour, now_est.minute
-            blocks = self.db.get_schedule_blocks_at(day, hour, minute)
+            blocks = due_blocks((await self.db_worker.run(lambda: self.db.get_all_schedule_blocks())), datetime.now(timezone.utc))
             for block in blocks:
                 uid = int(block["user_id"])
-                if not self._schedule_block_dms_enabled(uid):
+                if not (await self.db_worker.run(lambda: self._schedule_block_dms_enabled(uid))):
                     continue
                 date_est = now_est.date().isoformat()
-                dedupe_key = f"schedule_block:{int(block['id'])}:{date_est}:{hour:02d}:{minute:02d}"
+                dedupe_key = f"schedule_block:{int(block['id'])}:{block['starts_at'].isoformat()}"
                 embed = discord.Embed(
                     title="📚 Study Time!",
                     description=f"Your **{block['subject']}** block is starting now!",
@@ -1082,14 +1096,14 @@ class StudyBot(commands.Bot):
                 embed.add_field(name="Duration", value=f"{block['duration_minutes']} min")
                 embed.set_footer(text="Use /study start to begin tracking")
                 try:
-                    self.db.enqueue_outbox(
+                    (await self.db_worker.run(lambda: self.db.enqueue_outbox(
                         target_type="user",
                         target_id=uid,
                         kind="schedule_block_start",
                         settings_key="schedule_reminders",
                         dedupe_key=dedupe_key,
                         embed_json=self._outbox_embed_payload(embed),
-                    )
+                    )))
                     nudge_time = utcnow() + timedelta(minutes=15)
                     self.scheduler.add_job(
                         self._check_proc_for_block,
@@ -1108,7 +1122,7 @@ class StudyBot(commands.Bot):
     async def _check_proc_for_block(self, user_id: int, subject: str, block_id: int):
         if not self._schedule_block_dms_enabled(user_id):
             return
-        if self.db.get_active_session(user_id):
+        if (await self.db_worker.run(lambda: self.db.get_active_session(user_id))):
             return
         nudges = [
             f"Hey, your **{subject}** block started 15 minutes ago — still going to study? 👀",
@@ -1123,14 +1137,14 @@ class StudyBot(commands.Bot):
             f"{now_est.hour:02d}:{now_est.minute:02d}"
         )
         try:
-            self.db.enqueue_outbox(
+            (await self.db_worker.run(lambda: self.db.enqueue_outbox(
                 target_type="user",
                 target_id=int(user_id),
                 kind="schedule_block_nudge",
                 settings_key="schedule_reminders",
                 dedupe_key=dedupe_key,
                 embed_json=self._outbox_embed_payload(embed),
-            )
+            )))
         except Exception:
             log.debug("schedule nudge enqueue failed", exc_info=True)
 
@@ -1236,20 +1250,20 @@ class StudyBot(commands.Bot):
     async def _weekly_report(self):
         try:
             anchor = self._weekly_report_dedupe_anchor()
-            for row in self.db.get_all_users():
+            for row in (await self.db_worker.run(lambda: self.db.get_all_users())):
                 uid = int(row["user_id"])
-                embed = await asyncio.to_thread(self.build_weekly_report_embed, uid)
+                embed = await self.db_worker.run(self.build_weekly_report_embed, uid)
                 if embed is None:
                     continue
                 try:
-                    self.db.enqueue_outbox(
+                    (await self.db_worker.run(lambda: self.db.enqueue_outbox(
                         target_type="user",
                         target_id=uid,
                         kind="weekly_report",
                         settings_key="weekly_report",
                         dedupe_key=f"weekly_report:{uid}:{anchor}",
                         embed_json=self._outbox_embed_payload(embed),
-                    )
+                    )))
                 except Exception:
                     log.debug("weekly report enqueue failed (user_id=%s)", uid, exc_info=True)
                 await asyncio.sleep(0.02)
@@ -1261,7 +1275,7 @@ class StudyBot(commands.Bot):
     async def _friday_freeze_wipe(self):
         try:
             log.info("Friday freeze wipe...")
-            self.db.wipe_all_freezes()
+            (await self.db_worker.run(lambda: self.db.wipe_all_freezes()))
         except Exception:
             log.exception("Friday freeze wipe failed")
 
@@ -1305,7 +1319,7 @@ class StudyBot(commands.Bot):
             else:
                 season_key = f"unknown_{y}"
             log.info(f"Seasonal reset: {season_key}")
-            self.db.seasonal_reset(season_key)
+            (await self.db_worker.run(lambda: self.db.seasonal_reset(season_key)))
             # Server announcement (optional): post to configured seasonal/general channel.
             embed = discord.Embed(
                 title="🏅 Seasonal Reset",
@@ -1315,7 +1329,7 @@ class StudyBot(commands.Bot):
 
             # Snapshot: previous season top (from seasonal_history written during seasonal_reset)
             try:
-                top = self.db.get_seasonal_history_top_minutes(season_key, limit=3)
+                top = (await self.db_worker.run(lambda: self.db.get_seasonal_history_top_minutes(season_key, limit=3)))
             except Exception:
                 top = []
 
@@ -1324,7 +1338,7 @@ class StudyBot(commands.Bot):
                 medals = ["🥇", "🥈", "🥉"]
                 for i, row in enumerate(top[:3]):
                     uid = int(row.get("user_id") or 0)
-                    u = self.db.get_user(uid) or {}
+                    u = (await self.db_worker.run(lambda: self.db.get_user(uid))) or {}
                     name = u.get("username") or f"User {uid}"
                     mins = int(row.get("total_minutes") or 0)
                     lines.append(f"{medals[i]} **{name}** — {fmt_mins(mins)}")
@@ -1338,10 +1352,10 @@ class StudyBot(commands.Bot):
 
                 choice = int(hashlib.md5(season_key.encode("utf-8")).hexdigest(), 16) % 5
                 if choice == 0:
-                    row = self.db.get_seasonal_history_top_cheers(season_key) or {}
+                    row = (await self.db_worker.run(lambda: self.db.get_seasonal_history_top_cheers(season_key))) or {}
                     if int(row.get("cheers_sent_at_reset") or 0) > 0:
                         uid = int(row["user_id"])
-                        name = (self.db.get_user(uid) or {}).get("username") or f"User {uid}"
+                        name = ((await self.db_worker.run(lambda: self.db.get_user(uid))) or {}).get("username") or f"User {uid}"
                         embed.add_field(
                             name="📣 Season cheerleader",
                             value=f"**{name}** — {int(row['cheers_sent_at_reset']):,} cheers sent",
@@ -1350,10 +1364,10 @@ class StudyBot(commands.Bot):
                     else:
                         embed.add_field(name="📣 Season cheerleader", value="_No cheers yet_", inline=False)
                 elif choice == 1:
-                    row = self.db.get_seasonal_history_top_points(season_key) or {}
+                    row = (await self.db_worker.run(lambda: self.db.get_seasonal_history_top_points(season_key))) or {}
                     if int(row.get("points_at_reset") or 0) > 0:
                         uid = int(row["user_id"])
-                        name = (self.db.get_user(uid) or {}).get("username") or f"User {uid}"
+                        name = ((await self.db_worker.run(lambda: self.db.get_user(uid))) or {}).get("username") or f"User {uid}"
                         embed.add_field(
                             name="💠 Season points champ",
                             value=f"**{name}** — {int(row['points_at_reset']):,} points",
@@ -1362,10 +1376,10 @@ class StudyBot(commands.Bot):
                     else:
                         embed.add_field(name="💠 Season points champ", value="_No points yet_", inline=False)
                 elif choice == 2:
-                    row = self.db.get_seasonal_history_best_efficiency(season_key, min_minutes=60) or {}
+                    row = (await self.db_worker.run(lambda: self.db.get_seasonal_history_best_efficiency(season_key, min_minutes=60))) or {}
                     if int(row.get("total_minutes") or 0) > 0 and int(row.get("points_at_reset") or 0) > 0:
                         uid = int(row["user_id"])
-                        name = (self.db.get_user(uid) or {}).get("username") or f"User {uid}"
+                        name = ((await self.db_worker.run(lambda: self.db.get_user(uid))) or {}).get("username") or f"User {uid}"
                         ppm = float(row["ppm"])
                         embed.add_field(
                             name="⚙️ Most efficient",
@@ -1375,10 +1389,10 @@ class StudyBot(commands.Bot):
                     else:
                         embed.add_field(name="⚙️ Most efficient", value="_Not enough data yet_", inline=False)
                 elif choice == 3:
-                    row = self.db.get_seasonal_history_most_improved(season_key) or {}
+                    row = (await self.db_worker.run(lambda: self.db.get_seasonal_history_most_improved(season_key))) or {}
                     if int(row.get("delta_minutes") or 0) > 0:
                         uid = int(row["user_id"])
-                        name = (self.db.get_user(uid) or {}).get("username") or f"User {uid}"
+                        name = ((await self.db_worker.run(lambda: self.db.get_user(uid))) or {}).get("username") or f"User {uid}"
                         embed.add_field(
                             name="📈 Most improved",
                             value=f"**{name}** — +{fmt_mins(int(row['delta_minutes']))} vs last season",
@@ -1387,10 +1401,10 @@ class StudyBot(commands.Bot):
                     else:
                         embed.add_field(name="📈 Most improved", value="_No improvement data yet_", inline=False)
                 else:
-                    row = self.db.get_seasonal_history_best_efficiency(season_key, min_minutes=180) or {}
+                    row = (await self.db_worker.run(lambda: self.db.get_seasonal_history_best_efficiency(season_key, min_minutes=180))) or {}
                     if int(row.get("total_minutes") or 0) > 0 and int(row.get("points_at_reset") or 0) > 0:
                         uid = int(row["user_id"])
-                        name = (self.db.get_user(uid) or {}).get("username") or f"User {uid}"
+                        name = ((await self.db_worker.run(lambda: self.db.get_user(uid))) or {}).get("username") or f"User {uid}"
                         ppm = float(row["ppm"])
                         embed.add_field(
                             name="🚀 Breakthrough session",
@@ -1403,9 +1417,9 @@ class StudyBot(commands.Bot):
                 pass
 
             for guild in self.guilds:
-                channel_id = self.db.get_channel(guild.id, "seasonal")
+                channel_id = (await self.db_worker.run(lambda: self.db.get_channel(guild.id, "seasonal")))
                 if not channel_id:
-                    channel_id = self.db.get_channel(guild.id, "general")
+                    channel_id = (await self.db_worker.run(lambda: self.db.get_channel(guild.id, "general")))
                 if not channel_id:
                     continue
                 ch = self.get_channel(channel_id)
@@ -1432,7 +1446,7 @@ class StudyBot(commands.Bot):
             if str(payload.emoji) != "🔔":
                 return
 
-            msg_id = self.db.get_channel(payload.guild_id, "ping_role_message") or 0
+            msg_id = (await self.db_worker.run(lambda: self.db.get_channel(payload.guild_id, "ping_role_message"))) or 0
             if not msg_id or int(msg_id) != int(payload.message_id):
                 return
 
@@ -1465,7 +1479,7 @@ class StudyBot(commands.Bot):
             if str(payload.emoji) != "🔔":
                 return
 
-            msg_id = self.db.get_channel(payload.guild_id, "ping_role_message") or 0
+            msg_id = (await self.db_worker.run(lambda: self.db.get_channel(payload.guild_id, "ping_role_message"))) or 0
             if not msg_id or int(msg_id) != int(payload.message_id):
                 return
 
@@ -1494,12 +1508,12 @@ class StudyBot(commands.Bot):
 
     async def _hourly_cleanup(self):
         try:
-            self.db.expire_overflow()
-            self.db.expire_effects()
-            self.db.expire_beacons()
-            self.db.expire_bounties_and_refund()
-            self.db.cleanup_old_data()
-            self.db.cleanup_outbox(keep_sent_days=14, keep_failed_days=30)
+            (await self.db_worker.run(lambda: self.db.expire_overflow()))
+            (await self.db_worker.run(lambda: self.db.expire_effects()))
+            (await self.db_worker.run(lambda: self.db.expire_beacons()))
+            (await self.db_worker.run(lambda: self.db.expire_bounties_and_refund()))
+            (await self.db_worker.run(lambda: self.db.cleanup_old_data()))
+            (await self.db_worker.run(lambda: self.db.cleanup_outbox(keep_sent_days=14, keep_failed_days=30)))
         except Exception:
             log.exception("Hourly cleanup failed")
 
@@ -1540,19 +1554,19 @@ class StudyBot(commands.Bot):
         # 1. Zombie Sweeper — only run when *no* active sessions exist.
         # If there are active sessions, users should be able to stop them manually to receive rewards.
         try:
-            active = self.db.get_all_active_sessions()
+            active = (await self.db_worker.run(lambda: self.db.get_all_active_sessions()))
             if active:
                 log.info("Skipping zombie sweeper: %s active study session(s) exist.", len(active))
             else:
-                zombies = self.db.get_zombie_sessions()
+                zombies = (await self.db_worker.run(lambda: self.db.get_zombie_sessions()))
                 for z in zombies:
                     uid = int(z.get("user_id") or 0)
                     # No active sessions exist, so we can safely clear truly broken rows.
-                    self.db.kill_zombie_session(int(z["id"]))
+                    (await self.db_worker.run(lambda: self.db.kill_zombie_session(int(z["id"]))))
                     log.info("Killed zombie session %s (user %s)", z["id"], uid)
-            stale_lobbies = self.db.get_stale_lobbies()
+            stale_lobbies = (await self.db_worker.run(lambda: self.db.get_stale_lobbies()))
             for lobby in stale_lobbies:
-                self.db.end_group_lobby(lobby["id"])
+                (await self.db_worker.run(lambda: self.db.end_group_lobby(lobby["id"])))
                 log.info(f"Killed stale lobby {lobby['id']}")
         except Exception as e:
             log.warning(f"Zombie sweep error: {e}")
@@ -1560,7 +1574,7 @@ class StudyBot(commands.Bot):
         # 2. Recover active study session live-update tasks (+ inactivity monitor; survives gateway reconnect)
         try:
             study_cog = self.cogs.get("Study")
-            for session in self.db.get_all_active_sessions():
+            for session in (await self.db_worker.run(lambda: self.db.get_all_active_sessions())):
                 uid = session["user_id"]
                 if study_cog and session.get("live_channel_id") and not session.get("is_paused"):
                     study_cog._start_live_task(uid)
@@ -1576,8 +1590,8 @@ class StudyBot(commands.Bot):
         try:
             pomo_cog = self.cogs.get("Pomodoro")
             if pomo_cog:
-                pomo_cog.recover_group_timers_after_gateway_reconnect()
-            for pomo in self.db.get_all_active_pomodoros():
+                (await pomo_cog.recover_group_timers_after_gateway_reconnect())
+            for pomo in (await self.db_worker.run(lambda: self.db.get_all_active_pomodoros())):
                 uid = pomo["user_id"]
                 phase = pomo["current_phase"]
                 if phase == "work":
@@ -1598,7 +1612,7 @@ class StudyBot(commands.Bot):
                         asyncio.create_task(pomo_cog._transition_phase(uid, pomo, auto=True))
                     else:
                         log.info(f"Pomodoro for {uid}: resuming with {remaining_secs}s left in {phase}")
-                        pomo_cog._schedule_phase_safe(uid, pomo)
+                        (await pomo_cog._schedule_phase_safe(uid, pomo))
         except Exception as e:
             log.warning(f"Pomodoro recovery error: {e}")
 
@@ -1613,16 +1627,13 @@ class StudyBot(commands.Bot):
                 for ago in range(1, 30):
                     t = now_est - timedelta(minutes=ago)
                     day = t.strftime("%A").lower()
-                    blocks = self.db.get_schedule_blocks_at(day, t.hour, t.minute)
+                    blocks = due_blocks((await self.db_worker.run(lambda: self.db.get_all_schedule_blocks())), t.astimezone(timezone.utc))
                     for block in blocks:
                         uid = int(block["user_id"])
-                        if not self._schedule_block_dms_enabled(uid):
+                        if not (await self.db_worker.run(lambda: self._schedule_block_dms_enabled(uid))):
                             continue
                         date_est = t.date().isoformat()
-                        dedupe_key = (
-                            f"schedule_catchup:{int(block['id'])}:{date_est}:"
-                            f"{t.hour:02d}:{t.minute:02d}"
-                        )
+                        dedupe_key = f"schedule_block:{int(block['id'])}:{block['starts_at'].isoformat()}"
                         embed = discord.Embed(
                             title="📚 Late Schedule Reminder",
                             description=(
@@ -1632,14 +1643,14 @@ class StudyBot(commands.Bot):
                         )
                         embed.set_footer(text="Use /study start to begin tracking")
                         try:
-                            self.db.enqueue_outbox(
+                            (await self.db_worker.run(lambda: self.db.enqueue_outbox(
                                 target_type="user",
                                 target_id=uid,
                                 kind="schedule_catchup",
                                 settings_key="schedule_reminders",
                                 dedupe_key=dedupe_key,
                                 embed_json=self._outbox_embed_payload(embed),
-                            )
+                            )))
                         except Exception:
                             log.debug("schedule catch-up enqueue failed", exc_info=True)
                         await asyncio.sleep(0.02)
@@ -1653,9 +1664,9 @@ class StudyBot(commands.Bot):
                 if not owner:
                     return
                 now_est_str = datetime.now(EST).strftime("%I:%M %p EST")
-                active = self.db.get_all_active_sessions()
-                pomo_active = self.db.get_all_active_pomodoros()
-                boss = self.db.get_active_boss()
+                active = (await self.db_worker.run(lambda: self.db.get_all_active_sessions()))
+                pomo_active = (await self.db_worker.run(lambda: self.db.get_all_active_pomodoros()))
+                boss = (await self.db_worker.run(lambda: self.db.get_active_boss()))
                 embed = discord.Embed(
                     title="✅ StudyBot is online!",
                     description=f"Ready. It's **{now_est_str}**.",
@@ -1702,8 +1713,8 @@ class CheckinView(discord.ui.View):
 
     @discord.ui.button(label="Yes, I studied!", style=discord.ButtonStyle.success, emoji="✅")
     async def yes(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.bot.db.record_checkin(self.user_id, self.date, studied=True, restore_streak=True)
-        user_data = self.bot.db.get_user(self.user_id)
+        (await self.bot.db_worker.run(lambda: self.bot.db.record_checkin(self.user_id, self.date, studied=True, restore_streak=True)))
+        user_data = (await self.bot.db_worker.run(lambda: self.bot.db.get_user(self.user_id)))
         embed = discord.Embed(title="✅ Logged!", description="Nice work — keep that streak alive! 🔥", color=0x57F287)
         embed.add_field(name="Current Streak", value=f"{user_data['streak']} days")
         await interaction.response.edit_message(embed=embed, view=None)
@@ -1711,7 +1722,7 @@ class CheckinView(discord.ui.View):
 
     @discord.ui.button(label="No, I didn't", style=discord.ButtonStyle.danger, emoji="❌")
     async def no(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.bot.db.record_checkin(self.user_id, self.date, studied=False)
+        (await self.bot.db_worker.run(lambda: self.bot.db.record_checkin(self.user_id, self.date, studied=False)))
         embed = discord.Embed(
             title="❌ Noted",
             description="Tomorrow's a new day. Want to sneak in a quick session?\n"
@@ -1769,7 +1780,7 @@ def _help_command_sections(*, is_lite: bool) -> dict[str, str]:
         return {
             "📚 Study": (
                 "`/study start` `[subject]` `[target]` · `/pause` · `/resume` · `/stop` `[notes]`\n"
-                "`/note` · `/extend` · `/status` · `/history`"
+                "`/note` · `/extend` · `/status` · `/history` · `/study timer` (lasting DM card)"
             ),
             "🍅 Pomodoro": (
                 "`/pomodoro start` · `/pomodoro status` · `/pomodoro skip` · `/pomodoro stop`\n"
@@ -1777,24 +1788,25 @@ def _help_command_sections(*, is_lite: bool) -> dict[str, str]:
             ),
             "📁 Projects": "`/project add` · `list` · `view` · `done` · `delete`",
             "✅ Tasks": (
-                "`/task add` · `list` · `complete` · `complete_many` · `delete` · `history` · `reviews`"
+                "`/task create` (form) · `/task add` · `list` · `complete` · `complete_many` · `delete` · `history` · `reviews`"
             ),
-            "⏰ Reminders": "`/remind add <when> <message>` — e.g. `30m`, `3:30pm`, `6/5/2026 1:00pm` (US Eastern)",
+            "⏰ Reminders": "`/remind at` (date/time picker) · `/remind add <when> <message>` — e.g. `30m`, `tomorrow 9am` (your saved timezone)",
             "📅 Schedule": (
-                "`/schedule add` (hour **0–23**, minute **0–59** EST) · `/schedule view` · `/schedule delete`"
+                "`/schedule create` (form) · `/schedule add` (saved timezone) · `/schedule view` · `/schedule delete`"
             ),
             "🔥 Streaks & goals": (
                 "`/streak` · `/goals set` · `set-day` · `view` · `progress`\n"
                 "`/checkin` · `/adaptive`"
             ),
-            "⚙️ Settings": "`/settings` — Ghost Mode, DM toggles",
+            "⚙️ Settings": "`/settings` — save Ghost Mode, DM choices, and timezone together",
+            "📆 Group planning & message actions": "`/study_plan event` · `/study_plan poll` (server only). Right-click a message → Apps → Create task or Remind me about this.",
             "📊 Stats & export": "`/stats` · `/today` · `/breakdown` · `/export`",
             "🎁 Temptation bundle": "`/bundle set` · `/bundle status` · `/bundle clear` — pair a treat with study/Pomodoro (see `/tutorial`)",
         }
     return {
         "📚 Study": (
             "`/study start` `[subject]` `[target]` · `/pause` · `/resume` · `/stop` `[notes]`\n"
-            "`/note` · `/extend` · `/status` · `/history`"
+            "`/note` · `/extend` · `/status` · `/history` · `/study timer` (lasting DM card)"
         ),
         "🍅 Pomodoro": (
             "`/pomodoro start` · `/pomodoro status` · `/pomodoro skip` · `/pomodoro stop`\n"
@@ -1808,17 +1820,18 @@ def _help_command_sections(*, is_lite: bool) -> dict[str, str]:
         "🏆 Social & rankings": "`/cheer` · `/who` · `/leaderboard` · `/badges`",
         "📁 Projects": "`/project add` · `list` · `view` · `done` · `delete`",
         "✅ Tasks": (
-            "`/task add` · `list` · `complete` · `complete_many` · `delete` · `history` · `reviews`"
+            "`/task create` (form) · `/task add` · `list` · `complete` · `complete_many` · `delete` · `history` · `reviews`"
         ),
-        "⏰ Reminders": "`/remind add <when> <message>` — e.g. `30m`, `3:30pm`, `6/5/2026 1:00pm` (US Eastern)",
+        "⏰ Reminders": "`/remind at` (date/time picker) · `/remind add <when> <message>` — e.g. `30m`, `tomorrow 9am` (your saved timezone)",
         "📅 Schedule": (
-            "`/schedule add` (hour **0–23**, minute **0–59** EST) · `/schedule view` · `/schedule delete`"
+            "`/schedule create` (form) · `/schedule add` (saved timezone) · `/schedule view` · `/schedule delete`"
         ),
         "🔥 Streaks & goals": (
             "`/streak` · `/goals set` · `set-day` · `view` · `progress`\n"
             "`/checkin` · `/adaptive`"
         ),
-        "⚙️ Settings": "`/settings` — Ghost Mode, DM toggles",
+        "⚙️ Settings": "`/settings` — save Ghost Mode, DM choices, and timezone together",
+        "📆 Group planning & message actions": "`/study_plan event` · `/study_plan poll` (server only). Right-click a message → Apps → Create task or Remind me about this.",
         "📊 Stats & export": "`/stats` · `/today` · `/breakdown` · `/export`",
         "🎁 Temptation bundle": "`/bundle set` · `/bundle status` · `/bundle clear` — pair a treat with study/Pomodoro (see `/tutorial`)",
     }
@@ -1834,7 +1847,7 @@ def _build_help_embed(topic_index: int, *, is_lite: bool) -> discord.Embed:
     )
     embed = discord.Embed(
         title="📚 StudyBot — Help",
-        description="All times are **EST**.",
+        description="Schedules and reminders use your saved timezone. Daily goals, streaks, and resets use US Eastern. Open `/today` for your interactive dashboard.",
         color=0x5865F2,
     )
     if topic_index == 0:
@@ -1990,23 +2003,25 @@ async def _graceful_shutdown(bot_instance):
     """Save state and clean up before exit (important for Termux/Android)."""
     log.info("Graceful shutdown initiated...")
     try:
-        zombie = bot_instance.db.get_all_active_sessions()
+        zombie = (await bot_instance.db_worker.run(lambda: bot_instance.db.get_all_active_sessions()))
         for s in zombie:
-            bot_instance.db.end_session(s["user_id"])
+            (await bot_instance.db_worker.run(lambda: bot_instance.db.end_session(s["user_id"])))
             log.info(f"  Saved active session for user {s['user_id']}")
 
-        active_pomos = bot_instance.db.get_all_active_pomodoros()
+        active_pomos = (await bot_instance.db_worker.run(lambda: bot_instance.db.get_all_active_pomodoros()))
         for p in active_pomos:
-            bot_instance.db.end_pomodoro(p["user_id"])
+            (await bot_instance.db_worker.run(lambda: bot_instance.db.end_pomodoro(p["user_id"])))
             log.info(f"  Ended active pomodoro for user {p['user_id']}")
     except Exception as e:
         log.warning(f"Session save during shutdown: {e}")
 
     try:
         import sqlite3
-        conn = sqlite3.connect(bot_instance.db.path)
-        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        conn.close()
+        from contextlib import closing
+        def checkpoint():
+            with closing(sqlite3.connect(bot_instance.db.path)) as conn:
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        await bot_instance.db_worker.run(checkpoint)
         log.info("SQLite WAL checkpointed.")
     except Exception as e:
         log.warning(f"WAL checkpoint: {e}")
@@ -2014,6 +2029,7 @@ async def _graceful_shutdown(bot_instance):
     if bot_instance.scheduler.running:
         bot_instance.scheduler.shutdown(wait=False)
 
+    bot_instance.db_worker.close()
     log.info("Shutdown complete.")
 
 

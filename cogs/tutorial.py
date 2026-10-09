@@ -165,7 +165,8 @@ def _embed(idx: int, *, is_lite: bool = False) -> discord.Embed:
                 name="All `/study` subcommands",
                 value=(
                     "`/study start` `[subject]` `[target]` · `/study pause` · `/study resume` · `/study stop` "
-                    "`[notes]` · `/study note` · `/study extend` · `/study status` · `/study history`"
+                    "`[notes]` · `/study note` · `/study extend` · `/study status` · `/study history`\n"
+                    "Private cards refresh for 15 minutes; reopen `/study status` anytime. `/study timer` sends a lasting DM card with restart-safe controls."
                 ),
                 inline=False,
             )
@@ -658,7 +659,7 @@ def _embed(idx: int, *, is_lite: bool = False) -> discord.Embed:
             .add_field(
                 name="`/task` …",
                 value=(
-                    "`add` · `list` · `complete` · `complete_many` · `delete` · `history` · `reviews`\n"
+                    "`create` (guided form) · `add` · `list` · `complete` · `complete_many` · `delete` · `history` · `reviews`\n"
                     "**`add`** — completion **points** clamp **1–500**, priority high/medium/low, optional due date "
                     "(**MM/DD/YYYY**, **MM-DD-YYYY**, or **YYYY-MM-DD**), optional **`project_id`**, optional **SRS review** with interval **1–60** "
                     "days.\n"
@@ -679,9 +680,9 @@ def _embed(idx: int, *, is_lite: bool = False) -> discord.Embed:
             .add_field(
                 name="`/remind` …",
                 value=(
-                    "`add` — **US Eastern** fire times (`30m`, `2h30m`, `3:30pm`, `tomorrow 9am`, "
+                    "`at` — Discord date/time picker. `add` — **your saved timezone** (`30m`, `2h30m`, `3:30pm`, `tomorrow 9am`, "
                     "`6/5/2026 1:00pm`, or `2026-06-05 13:00`); **`message` 1–200** characters.\n"
-                    "`list` / `delete` — numeric IDs from `list`; fire times stored in UTC, shown in US Eastern."
+                    "`list` / `delete` — numeric IDs from `list`; fire times stored in UTC, displayed in your Discord timezone. Right-click a message → Apps → Remind me about this to keep its link."
                 ),
                 inline=False,
             )
@@ -689,6 +690,7 @@ def _embed(idx: int, *, is_lite: bool = False) -> discord.Embed:
                 name="`/schedule` …",
                 value=(
                     "`add` — recurring blocks with **day grammar** (`MWF`, `weekdays`, `daily`, comma lists, etc.).\n"
+                    "`create` — guided day/time form. New blocks use the timezone in `/settings`; existing blocks keep their original timezone.\n"
                     "`view` — splits across multiple embed fields when you hit many blocks.\n"
                     "`delete` — remove by block ID from `view`.\n"
                     "Footer reminds you to enable **Schedule Reminders** in `/settings` for DM nudges."
@@ -716,8 +718,7 @@ def _embed(idx: int, *, is_lite: bool = False) -> discord.Embed:
             .add_field(
                 name="`/today`",
                 value=(
-                    "Tighter **daily** snapshot: streak, goal bar, potions, overflow, raid boss snippet, schedule DM "
-                    "warnings if reminders disabled — ideal phone-glance during sessions."
+                    "Interactive daily dashboard: goal, streak, active session controls, tasks and reviews, next study block, plus quick forms and Pomodoro. Quests, raids and potions appear in supported server contexts. Refresh to update the card."
                 ),
                 inline=False,
             )

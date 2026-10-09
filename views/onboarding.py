@@ -25,11 +25,12 @@ class OnboardingView(discord.ui.View):
 
     @discord.ui.button(label="Open settings", style=discord.ButtonStyle.primary, emoji="⚙️")
     async def open_settings(self, interaction: discord.Interaction, button: discord.ui.Button):
-        from cogs.profile import DM_TOGGLES, SettingsView
+        from cogs.profile import DM_TOGGLES
+        from views.forms import PreferencesView
 
         uid = interaction.user.id
-        self.bot.db.ensure_user(uid, interaction.user.display_name)
-        user = self.bot.db.get_user(uid)
+        (await self.bot.db_worker.run(lambda: self.bot.db.ensure_user(uid, interaction.user.display_name)))
+        user = (await self.bot.db_worker.run(lambda: self.bot.db.get_user(uid)))
 
         embed = discord.Embed(title="⚙️ Settings", color=COLOR_PRIMARY)
         ghost = "🟢 ON" if user.get("ghost_mode") else "🔴 OFF"
@@ -40,13 +41,13 @@ class OnboardingView(discord.ui.View):
 
         dm_lines = []
         for key, label in DM_TOGGLES.items():
-            enabled = self.bot.db.get_dm_enabled(uid, key)
+            enabled = (await self.bot.db_worker.run(lambda: self.bot.db.get_dm_enabled(uid, key)))
             status = "✅" if enabled else "❌"
             dm_lines.append(f"{status} {label}")
         embed.add_field(name="📬 DM Notifications", value="\n".join(dm_lines), inline=False)
 
         # Send a separate ephemeral message so the onboarding card/buttons remain usable.
-        await interaction.response.send_message(embed=embed, view=SettingsView(self.bot, uid), ephemeral=True)
+        await interaction.response.send_message(embed=embed, view=PreferencesView(self.bot, uid), ephemeral=True)
 
     @discord.ui.button(label="Open tutorial", style=discord.ButtonStyle.secondary, emoji="📖")
     async def open_tutorial(self, interaction: discord.Interaction, button: discord.ui.Button):

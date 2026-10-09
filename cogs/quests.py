@@ -20,13 +20,13 @@ class Quests(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
 
-    def assign_quests_for_user(self, user_id: int):
+    async def assign_quests_for_user(self, user_id: int):
         quests = []
         for tier in [1, 2, 3]:
             pool = QUEST_POOLS[tier]
             pick = random.choice(pool)
             quests.append({"tier": tier, "quest_key": pick["key"], "target": pick["target"]})
-        self.bot.db.assign_daily_quests(user_id, quests)
+        (await self.bot.db_worker.run(lambda: self.bot.db.assign_daily_quests(user_id, quests)))
 
     async def track_quest(self, user_id: int, metric: str, amount: int = 1):
         """Called by other cogs when a trackable event happens."""
@@ -36,18 +36,18 @@ class Quests(commands.Cog):
 
         newly_completed = []
         for qk in quest_keys:
-            completed = self.bot.db.update_quest_progress(user_id, qk, amount)
+            completed = (await self.bot.db_worker.run(lambda: self.bot.db.update_quest_progress(user_id, qk, amount)))
             newly_completed.extend(completed)
 
         for q in newly_completed:
             reward = TIER_REWARDS.get(q["tier"], 0)
             if reward > 0:
-                self.bot.db.add_points(user_id, reward, reason=f"Quest: {q['quest_key']}")
+                (await self.bot.db_worker.run(lambda: self.bot.db.add_points(user_id, reward, reason=f"Quest: {q['quest_key']}")))
 
-            if self.bot.db.get_dm_enabled(user_id, "quest_completion"):
+            if (await self.bot.db_worker.run(lambda: self.bot.db.get_dm_enabled(user_id, "quest_completion"))):
                 qdate = str(q.get("date") or datetime.now(EST).date().isoformat())
                 qrow_id = int(q.get("id") or 0)
-                self.bot.db.enqueue_outbox(
+                (await self.bot.db_worker.run(lambda: self.bot.db.enqueue_outbox(
                     target_type="user",
                     target_id=int(user_id),
                     kind="quest_complete",
@@ -60,16 +60,16 @@ class Quests(commands.Cog):
                         ),
                         "color": int(COLOR_SUCCESS),
                     },
-                )
+                )))
 
-        if newly_completed and self.bot.db.check_all_quests_complete(user_id):
-            self.bot.db.add_points(user_id, ALL_COMPLETE_BONUS_PTS, reason="All daily quests complete")
-            self.bot.db.add_xp(user_id, ALL_COMPLETE_BONUS_XP)
+        if newly_completed and (await self.bot.db_worker.run(lambda: self.bot.db.check_all_quests_complete(user_id))):
+            (await self.bot.db_worker.run(lambda: self.bot.db.add_points(user_id, ALL_COMPLETE_BONUS_PTS, reason="All daily quests complete")))
+            (await self.bot.db_worker.run(lambda: self.bot.db.add_xp(user_id, ALL_COMPLETE_BONUS_XP)))
             await self.track_quest(user_id, "all_quests_done")
 
-            if self.bot.db.get_dm_enabled(user_id, "quest_completion"):
+            if (await self.bot.db_worker.run(lambda: self.bot.db.get_dm_enabled(user_id, "quest_completion"))):
                 bonus_date = datetime.now(EST).date().isoformat()
-                self.bot.db.enqueue_outbox(
+                (await self.bot.db_worker.run(lambda: self.bot.db.enqueue_outbox(
                     target_type="user",
                     target_id=int(user_id),
                     kind="quest_all_complete",
@@ -82,7 +82,7 @@ class Quests(commands.Cog):
                         ),
                         "color": int(COLOR_GOLD),
                     },
-                )
+                )))
 
     @app_commands.command(name="quests", description="View today's daily quests")
     async def quests_cmd(self, interaction: discord.Interaction):
@@ -90,12 +90,12 @@ class Quests(commands.Cog):
             await interaction.response.send_message("Lite mode: RPG features (quests) are disabled for your account.", ephemeral=True)
             return
         uid = interaction.user.id
-        self.bot.db.ensure_user(uid, interaction.user.display_name)
+        (await self.bot.db_worker.run(lambda: self.bot.db.ensure_user(uid, interaction.user.display_name)))
 
-        quests = self.bot.db.get_daily_quests(uid)
+        quests = (await self.bot.db_worker.run(lambda: self.bot.db.get_daily_quests(uid)))
         if not quests:
-            self.assign_quests_for_user(uid)
-            quests = self.bot.db.get_daily_quests(uid)
+            (await self.assign_quests_for_user(uid))
+            quests = (await self.bot.db_worker.run(lambda: self.bot.db.get_daily_quests(uid)))
 
         embed = discord.Embed(title="📜 Daily Quests", color=COLOR_PRIMARY)
         tier_labels = {1: "Easy", 2: "Medium", 3: "Hard"}
@@ -142,8 +142,8 @@ class Quests(commands.Cog):
             return
         uid = interaction.user.id
         async with self.bot.user_locks[uid]:
-            self.bot.db.ensure_user(uid, interaction.user.display_name)
-            perks = self.bot.db.get_prestige_perks(uid)
+            (await self.bot.db_worker.run(lambda: self.bot.db.ensure_user(uid, interaction.user.display_name)))
+            perks = (await self.bot.db_worker.run(lambda: self.bot.db.get_prestige_perks(uid)))
             if "tactician" not in perks:
                 await interaction.response.send_message(
                     "You need the **Tactician** perk (Prestige 2) to reroll quests.",
@@ -152,14 +152,14 @@ class Quests(commands.Cog):
                 return
 
             today_est = datetime.now(EST).date().isoformat()
-            if self.bot.db.get_setting(uid, QUEST_REROLL_DATE_KEY, "") == today_est:
+            if (await self.bot.db_worker.run(lambda: self.bot.db.get_setting(uid, QUEST_REROLL_DATE_KEY, ""))) == today_est:
                 await interaction.response.send_message(
                     "You've already used your **Tactician** reroll today (1/day). Try again tomorrow!",
                     ephemeral=True,
                 )
                 return
 
-            quests = self.bot.db.get_daily_quests(uid)
+            quests = (await self.bot.db_worker.run(lambda: self.bot.db.get_daily_quests(uid)))
             current = next((q for q in quests if q["tier"] == tier), None)
             if not current:
                 await interaction.response.send_message("No quest found for that tier.", ephemeral=True)
@@ -175,8 +175,8 @@ class Quests(commands.Cog):
                 return
 
             new = random.choice(candidates)
-            self.bot.db.reroll_quest(uid, tier, new["key"], new["target"])
-            self.bot.db.set_setting(uid, QUEST_REROLL_DATE_KEY, today_est)
+            (await self.bot.db_worker.run(lambda: self.bot.db.reroll_quest(uid, tier, new["key"], new["target"])))
+            (await self.bot.db_worker.run(lambda: self.bot.db.set_setting(uid, QUEST_REROLL_DATE_KEY, today_est)))
 
             embed = discord.Embed(
                 title="🔄 Quest Rerolled!",

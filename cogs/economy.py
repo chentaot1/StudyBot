@@ -28,10 +28,10 @@ class Economy(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
 
-    def _potion_params_for_user(self, user_id: int, potion_key: str) -> dict:
+    async def _potion_params_for_user(self, user_id: int, potion_key: str) -> dict:
         """Match Shop potion rules (Time Lord / Master Alchemist)."""
         base = POTION_CATALOG[potion_key].copy()
-        perks = self.bot.db.get_prestige_perks(user_id)
+        perks = (await self.bot.db_worker.run(lambda: self.bot.db.get_prestige_perks(user_id)))
         if "time_lord" in perks:
             base["hours"] *= 2
         if "master_alchemist" in perks:
@@ -51,19 +51,19 @@ class Economy(commands.Cog):
         key = which
         await interaction.response.defer(ephemeral=True)
         async with self.bot.user_locks[uid]:
-            self.bot.db.ensure_user(uid, interaction.user.display_name)
+            (await self.bot.db_worker.run(lambda: self.bot.db.ensure_user(uid, interaction.user.display_name)))
             if key not in POTION_CATALOG:
                 await interaction.followup.send("Unknown potion type.", ephemeral=True)
                 return
-            if not self.bot.db.use_inventory_item(uid, "potion", key):
+            if not (await self.bot.db_worker.run(lambda: self.bot.db.use_inventory_item(uid, "potion", key))):
                 await interaction.followup.send(
                     f"You don't have any **{POTION_CATALOG[key]['name']}** in your inventory. "
                     f"Open `/inventory` to see what you own.",
                     ephemeral=True,
                 )
                 return
-            params = self._potion_params_for_user(uid, key)
-            _, extended = self.bot.db.activate_potion(uid, f"potion_{key}", params["mult"], params["hours"])
+            params = (await self._potion_params_for_user(uid, key))
+            _, extended = (await self.bot.db_worker.run(lambda: self.bot.db.activate_potion(uid, f"potion_{key}", params["mult"], params["hours"])))
             verb = "Time extended!" if extended else "Bottoms up!"
             embed = discord.Embed(
                 title=f"🧪 {params['name']} — {verb}",
@@ -78,8 +78,8 @@ class Economy(commands.Cog):
         self, interaction: discord.Interaction, current: str
     ) -> list[app_commands.Choice[str]]:
         uid = interaction.user.id
-        self.bot.db.ensure_user(uid, str(interaction.user))
-        inv = self.bot.db.get_inventory(uid)
+        (await self.bot.db_worker.run(lambda: self.bot.db.ensure_user(uid, str(interaction.user))))
+        inv = (await self.bot.db_worker.run(lambda: self.bot.db.get_inventory(uid)))
         choices: list[app_commands.Choice[str]] = []
         cur = (current or "").lower()
         for row in inv:
@@ -104,11 +104,11 @@ class Economy(commands.Cog):
         uid = interaction.user.id
         await interaction.response.defer(ephemeral=True)
         async with self.bot.user_locks[uid]:
-            self.bot.db.ensure_user(uid, interaction.user.display_name)
+            (await self.bot.db_worker.run(lambda: self.bot.db.ensure_user(uid, interaction.user.display_name)))
             amount = max(1, min(amount, 50))
             results = []
             for _ in range(amount):
-                result = self.bot.db.convert_points(uid)
+                result = (await self.bot.db_worker.run(lambda: self.bot.db.convert_points(uid)))
                 if not result:
                     break
                 if "error" in result:
@@ -126,17 +126,17 @@ class Economy(commands.Cog):
             if "error" in last:
                 if successful:
                     total_cost = sum(r["cost"] for r in successful)
-                    user = self.bot.db.get_user(uid)
+                    user = (await self.bot.db_worker.run(lambda: self.bot.db.get_user(uid)))
                     to_wallet = sum(r.get("coin_direct", 0) for r in successful)
                     to_overflow = sum(r.get("coin_overflow", 0) for r in successful)
                     if last["error"] == "daily_limit":
-                        limit = self.bot.db.get_convert_limit(uid)
+                        limit = (await self.bot.db_worker.run(lambda: self.bot.db.get_convert_limit(uid)))
                         desc = (
                             f"**{len(successful)}** conversion(s) completed, then you hit the daily limit "
                             f"({limit}/day). Your points and coins for those conversions are already applied."
                         )
                     else:
-                        cost = self.bot.db.get_convert_cost(uid)
+                        cost = (await self.bot.db_worker.run(lambda: self.bot.db.get_convert_cost(uid)))
                         desc = (
                             f"**{len(successful)}** conversion(s) completed; not enough points for another "
                             f"(**{cost:,}** pts each). Your earlier conversions are already applied."
@@ -166,13 +166,13 @@ class Economy(commands.Cog):
                     return
 
                 if last["error"] == "daily_limit":
-                    limit = self.bot.db.get_convert_limit(uid)
+                    limit = (await self.bot.db_worker.run(lambda: self.bot.db.get_convert_limit(uid)))
                     await interaction.followup.send(
                         f"You've hit your daily conversion limit ({limit}/day). Come back tomorrow!",
                         ephemeral=True
                     )
                 elif last["error"] == "insufficient_points":
-                    cost = self.bot.db.get_convert_cost(uid)
+                    cost = (await self.bot.db_worker.run(lambda: self.bot.db.get_convert_cost(uid)))
                     await interaction.followup.send(
                         f"Not enough points. You need **{cost:,}** pts per conversion.",
                         ephemeral=True
@@ -180,7 +180,7 @@ class Economy(commands.Cog):
                 return
 
             total_cost = sum(r["cost"] for r in successful)
-            user = self.bot.db.get_user(uid)
+            user = (await self.bot.db_worker.run(lambda: self.bot.db.get_user(uid)))
             to_wallet = sum(r.get("coin_direct", 0) for r in successful)
             to_overflow = sum(r.get("coin_overflow", 0) for r in successful)
             embed = discord.Embed(title="🪙 Points Converted!", color=COLOR_GOLD)
@@ -211,8 +211,8 @@ class Economy(commands.Cog):
             return
         uid = interaction.user.id
         async with self.bot.user_locks[uid]:
-            self.bot.db.ensure_user(uid, interaction.user.display_name)
-            user = self.bot.db.get_user(uid)
+            (await self.bot.db_worker.run(lambda: self.bot.db.ensure_user(uid, interaction.user.display_name)))
+            user = (await self.bot.db_worker.run(lambda: self.bot.db.get_user(uid)))
             if user["level"] < MAX_LEVEL:
                 await interaction.response.send_message(
                     f"You must reach **Level {MAX_LEVEL}** before you can prestige. "
@@ -247,10 +247,10 @@ class Economy(commands.Cog):
             await interaction.response.send_message("Lite mode: RPG/economy features are disabled for your account.", ephemeral=True)
             return
         uid = interaction.user.id
-        self.bot.db.ensure_user(uid, interaction.user.display_name)
-        items = self.bot.db.get_inventory(uid)
-        potions = self.bot.db.get_active_potions(uid)
-        overflow = self.bot.db.get_overflow(uid)
+        (await self.bot.db_worker.run(lambda: self.bot.db.ensure_user(uid, interaction.user.display_name)))
+        items = (await self.bot.db_worker.run(lambda: self.bot.db.get_inventory(uid)))
+        potions = (await self.bot.db_worker.run(lambda: self.bot.db.get_active_potions(uid)))
+        overflow = (await self.bot.db_worker.run(lambda: self.bot.db.get_overflow(uid)))
 
         embed = discord.Embed(title="🎒 Inventory", color=COLOR_AQUA)
 
@@ -303,7 +303,7 @@ class PrestigeConfirmView(discord.ui.View):
             await interaction.response.send_message("This isn't yours.", ephemeral=True)
             return
         async with self.bot.user_locks[self.user_id]:
-            result = self.bot.db.prestige_up(self.user_id)
+            result = (await self.bot.db_worker.run(lambda: self.bot.db.prestige_up(self.user_id)))
             if not result:
                 await interaction.response.edit_message(
                     embed=discord.Embed(description="Prestige failed. Are you Level 50?", color=COLOR_ERROR),

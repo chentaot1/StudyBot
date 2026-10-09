@@ -6,6 +6,7 @@ from discord import app_commands
 from discord.ext import commands
 from datetime import datetime, timezone, timedelta
 from typing import Optional
+from typing import Literal
 import asyncio
 import time
 import random
@@ -20,6 +21,7 @@ from constants import (
 from utils import fmt_date_us_from_iso, fmt_mins, fmt_secs, fmt_weekday_datetime_us_est, parse_stored
 from temptation_bundle import bundle_live_line_for_study_session
 from services.rewards_engine import calc_xp_bonus_breakdown
+from views.persistent import bind_buttons
 
 log = logging.getLogger("StudyBot.Study")
 
@@ -33,20 +35,27 @@ class SessionNoteModal(discord.ui.Modal, title="Session note"):
         required=True,
     )
 
-    def __init__(self, cog: "Study", user_id: int):
+    def __init__(self, cog: "Study", user_id: int, session_id: int):
         super().__init__()
         self.cog = cog
         self.user_id = user_id
+        self.session_id = session_id
 
     async def on_submit(self, interaction: discord.Interaction):
         if interaction.user.id != self.user_id:
             await interaction.response.send_message("This note is for the session owner only.", ephemeral=True)
             return
-        if not self.cog.bot.db.add_session_note(self.user_id, self.text.value):
-            await interaction.response.send_message("❌ No active session.", ephemeral=True)
+        if not await self.cog.bot.tree.interaction_check(interaction):
             return
         await interaction.response.defer(ephemeral=True)
-        session = self.cog.bot.db.get_active_session(self.user_id)
+        session = await self.cog.bot.db_worker.run(self.cog.bot.db.get_active_session, self.user_id)
+        if not session or session["id"] != self.session_id:
+            await interaction.followup.send("This session has ended. Open /study status.", ephemeral=True)
+            return
+        if not (await self.cog.bot.db_worker.run(lambda: self.cog.bot.db.add_session_note(self.user_id, self.text.value, expected_session_id=self.session_id))):
+            await interaction.followup.send("❌ No active session.", ephemeral=True)
+            return
+        session = (await self.cog.bot.db_worker.run(lambda: self.cog.bot.db.get_active_session(self.user_id)))
         if session:
             await self.cog._edit_live_session_message(self.user_id, session=session)
         await interaction.followup.send("📝 Note saved.", ephemeral=True)
@@ -64,25 +73,30 @@ class StopSessionModal(discord.ui.Modal, title="Stop session (optional note)"):
         required=False,
     )
 
-    def __init__(self, cog: "Study", user_id: int):
+    def __init__(self, cog: "Study", user_id: int, session_id: int):
         super().__init__()
         self.cog = cog
         self.user_id = user_id
+        self.session_id = session_id
 
     async def on_submit(self, interaction: discord.Interaction):
         if interaction.user.id != self.user_id:
             await interaction.response.send_message("This action is for the session owner only.", ephemeral=True)
             return
-        await self.cog._stop_session(interaction, notes=self.text.value or "")
+        if not await self.cog.bot.tree.interaction_check(interaction):
+            return
+        await self.cog._stop_session(interaction, notes=self.text.value or "", expected_session_id=self.session_id)
 
 
 class StudySessionControlsView(discord.ui.View):
     """On the live session card: pause / resume / note / refresh (slash still works)."""
 
-    def __init__(self, cog: "Study", user_id: int):
+    def __init__(self, cog: "Study", user_id: int, session_id: int):
         super().__init__(timeout=None)
         self.cog = cog
         self.user_id = user_id
+        self.session_id = session_id
+        bind_buttons(self, f"sb:study:{user_id}:{session_id}")
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.user_id:
@@ -90,92 +104,44 @@ class StudySessionControlsView(discord.ui.View):
                 "These controls are only for the person in this study session.", ephemeral=True
             )
             return False
+        if not await self.cog.bot.tree.interaction_check(interaction):
+            return False
+        session = await self.cog.bot.db_worker.run(self.cog.bot.db.get_active_session, self.user_id)
+        if not session or session["id"] != self.session_id:
+            await interaction.response.send_message("This session has ended. Open /study status for current controls.", ephemeral=True)
+            return False
         return True
 
     @discord.ui.button(label="Pause", style=discord.ButtonStyle.primary, emoji="⏸️", row=0)
     async def pause_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        session = self.cog.bot.db.get_active_session(self.user_id)
-        if not session:
-            await interaction.response.send_message("❌ No active session.", ephemeral=True)
-            return
-        if session.get("is_paused"):
-            await interaction.response.send_message("⏸️ Already paused. Use **Resume**.", ephemeral=True)
-            return
-        self.cog.bot.db.pause_session(self.user_id)
-        self.cog._cancel_live_task(self.user_id)
-        session = self.cog.bot.db.get_active_session(self.user_id)
-        if not session:
-            log.error("pause_session left no active session row for user %s", self.user_id)
-            await interaction.response.send_message(
-                "⏸️ Paused, but session state is inconsistent. Use `/study status`.",
-                ephemeral=True,
-            )
-            return
-        await interaction.response.defer(ephemeral=True)
-        ok = await self.cog._edit_live_session_message(self.user_id, session=session)
-        if not ok:
-            await interaction.followup.send(
-                "⏸️ Paused, but the live card couldn't be updated. Try `/study status`.",
-                ephemeral=True,
-            )
+        await self.cog._set_paused(interaction, True, expected_session_id=self.session_id)
 
     @discord.ui.button(label="Resume", style=discord.ButtonStyle.success, emoji="▶️", row=0)
     async def resume_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        session = self.cog.bot.db.get_active_session(self.user_id)
-        if not session:
-            await interaction.response.send_message("❌ No active session.", ephemeral=True)
-            return
-        if not session.get("is_paused"):
-            await interaction.response.send_message("▶️ Session isn't paused.", ephemeral=True)
-            return
-        self.cog.bot.db.resume_session(self.user_id)
-        session = self.cog.bot.db.get_active_session(self.user_id)
-        if not session:
-            log.error("resume_session left no active session row for user %s", self.user_id)
-            await interaction.response.send_message(
-                "▶️ Resumed, but session state is inconsistent. Use `/study status`.",
-                ephemeral=True,
-            )
-            return
-        self.cog._start_live_task(self.user_id)
-        if (session.get("target_minutes") or 0) >= 10:
-            self.cog._ensure_motivation_task(self.user_id)
-        quest_cog = self.cog.bot.cogs.get("Quests")
-        if quest_cog:
-            await quest_cog.track_quest(self.user_id, "pause_resume")
-        await interaction.response.defer(ephemeral=True)
-        ok = await self.cog._edit_live_session_message(self.user_id, session=session)
-        if not ok:
-            await interaction.followup.send(
-                "▶️ Resumed, but the live card couldn't be updated. Try `/study status`.",
-                ephemeral=True,
-            )
+        await self.cog._set_paused(interaction, False, expected_session_id=self.session_id)
 
     @discord.ui.button(label="Note", style=discord.ButtonStyle.secondary, emoji="📝", row=0)
     async def note_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(SessionNoteModal(self.cog, self.user_id))
+        await interaction.response.send_modal(SessionNoteModal(self.cog, self.user_id, self.session_id))
 
     @discord.ui.button(label="Refresh", style=discord.ButtonStyle.secondary, emoji="🔄", row=0)
     async def refresh_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        session = self.cog.bot.db.get_active_session(self.user_id)
+        session = (await self.cog.bot.db_worker.run(lambda: self.cog.bot.db.get_active_session(self.user_id)))
         if not session:
             await interaction.response.send_message("❌ No active session.", ephemeral=True)
             return
-        await interaction.response.defer(ephemeral=True)
-        ok = await self.cog._edit_live_session_message(self.user_id, session=session)
-        if not ok:
-            await interaction.followup.send(
-                "Couldn't refresh the live card. Try `/study status`.",
-                ephemeral=True,
-            )
+        view = StudySessionControlsView(self.cog, self.user_id, self.session_id)
+        if interaction.message.flags.ephemeral:
+            view.timeout = 900
+        await interaction.response.edit_message(embed=await self.cog.bot.db_worker.run(self.cog._build_live_embed, session), view=view)
 
     @discord.ui.button(label="Stop", style=discord.ButtonStyle.danger, emoji="⏹️", row=1)
     async def stop_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        session = self.cog.bot.db.get_active_session(self.user_id)
+        session = (await self.cog.bot.db_worker.run(lambda: self.cog.bot.db.get_active_session(self.user_id)))
         if not session:
             await interaction.response.send_message("❌ No active session.", ephemeral=True)
             return
-        await interaction.response.send_modal(StopSessionModal(self.cog, self.user_id))
+        await interaction.response.send_modal(StopSessionModal(self.cog, self.user_id, self.session_id))
 
 
 def get_elapsed_and_paused(session: dict) -> tuple[int, int]:
@@ -241,7 +207,7 @@ def build_session_embed(
     if session.get("notes"):
         lines = session["notes"].split("\n")
         preview = "\n".join(lines[:3]) + (f"\n_+{len(lines)-3} more_" if len(lines) > 3 else "")
-        embed.add_field(name="📝 Notes", value=preview, inline=False)
+        embed.add_field(name="📝 Notes", value=preview[:1024], inline=False)
 
     if bundle_line:
         embed.add_field(name="🎁 Treat bundle", value=bundle_line[:1024], inline=False)
@@ -321,6 +287,7 @@ class Study(commands.Cog):
         self.motivation_tasks: dict[int, asyncio.Task] = {}
         self.inactivity_tasks: dict[int, asyncio.Task] = {}
         self._session_panel_views: dict[int, StudySessionControlsView] = {}
+        self._private_panels: dict[int, tuple[object, datetime]] = {}
 
     def _session_bundle_line(self, session: dict) -> str | None:
         uid = session.get("user_id")
@@ -391,6 +358,7 @@ class Study(commands.Cog):
         for task in self.motivation_tasks.values(): task.cancel()
         for task in self.inactivity_tasks.values(): task.cancel()
         self._session_panel_views.clear()
+        self._private_panels.clear()
 
     def _start_live_task(self, user_id: int):
         self._cancel_live_task(user_id)
@@ -402,28 +370,29 @@ class Study(commands.Cog):
             del self.live_tasks[user_id]
 
     async def _edit_live_session_message(self, user_id: int, *, session: dict | None = None) -> bool:
-        """Re-fetch and edit the live study card (same path as the 30s live loop).
-
-        Ephemeral slash follow-ups often break ``interaction.response.edit_message`` on buttons;
-        channel ``fetch_message`` + ``edit`` is reliable for those messages.
-        """
+        """Use webhook editing for private cards and normal editing for durable DMs."""
         if session is None:
-            session = self.bot.db.get_active_session(user_id)
+            session = (await self.bot.db_worker.run(lambda: self.bot.db.get_active_session(user_id)))
         if not session:
             return False
         ch_id, msg_id = session.get("live_channel_id"), session.get("live_message_id")
         if not ch_id or not msg_id:
             return False
         view = self._session_panel_views.get(user_id)
+        if view is None or view.is_finished():
+            view = StudySessionControlsView(self, user_id, session["id"])
+            self._session_panel_views[user_id] = view
         try:
-            ch = self.bot.get_channel(ch_id) or await self.bot.fetch_channel(ch_id)
-            msg = await ch.fetch_message(msg_id)
+            if session.get("live_kind") != "dm":
+                panel = self._private_panels.get(user_id)
+                if not panel or datetime.now(timezone.utc) >= panel[1]:
+                    return False
+                msg = panel[0]
+            else:
+                ch = self.bot.get_channel(ch_id) or await self.bot.fetch_channel(ch_id)
+                msg = ch.get_partial_message(msg_id)
             await msg.edit(
-                embed=build_session_embed(
-                    session,
-                    bundle_line=self._session_bundle_line(session),
-                    buff_line=self._session_buff_line(session),
-                ),
+                embed=await self.bot.db_worker.run(self._build_live_embed, session),
                 view=view,
             )
             return True
@@ -431,14 +400,80 @@ class Study(commands.Cog):
             log.warning("Live message edit failed: %s", e)
             return False
 
-    async def _stop_session(self, interaction: discord.Interaction, *, notes: str = ""):
+    def _build_live_embed(self, session):
+        return build_session_embed(session, bundle_line=self._session_bundle_line(session), buff_line=self._session_buff_line(session))
+
+    async def _set_paused(self, interaction, paused, *, expected_session_id=None):
+        await interaction.response.defer(ephemeral=True)
+        uid = interaction.user.id
+        async with self.bot.user_locks[uid]:
+            session = await self.bot.db_worker.run(self.bot.db.get_active_session, uid)
+            if not session or (expected_session_id is not None and session["id"] != expected_session_id):
+                await interaction.followup.send("This session has ended. Open /study status.", ephemeral=True)
+                return
+            if bool(session.get("is_paused")) == paused:
+                await interaction.followup.send("Already paused." if paused else "Already running.", ephemeral=True)
+                return
+            operation = self.bot.db.pause_session if paused else self.bot.db.resume_session
+            await self.bot.db_worker.run(operation, uid, expected_session_id=session["id"])
+            if paused:
+                self._cancel_live_task(uid)
+            else:
+                self._start_live_task(uid)
+                if (session.get("target_minutes") or 0) >= 10:
+                    self._ensure_motivation_task(uid)
+            session = await self.bot.db_worker.run(self.bot.db.get_active_session, uid)
+            updated = await self._edit_live_session_message(uid, session=session)
+        await interaction.followup.send(("Paused." if paused else "Resumed.") + (" Open /study status for a fresh private card." if not updated else ""), ephemeral=True)
+        quests = self.bot.get_cog("Quests")
+        if quests and not paused:
+            await quests.track_quest(uid, "pause_resume")
+
+    async def _publish_panel(self, interaction, session, *, delivery="private"):
+        uid = interaction.user.id
+        view = StudySessionControlsView(self, uid, session["id"])
+        embed = await self.bot.db_worker.run(self._build_live_embed, session)
+        if delivery == "dm":
+            try:
+                msg = await interaction.user.send(embed=embed, view=view)
+            except discord.Forbidden:
+                await interaction.followup.send("I couldn't send a DM. Enable DMs and try /study timer again; /study status still works privately.", ephemeral=True)
+                return
+            self._private_panels.pop(uid, None)
+            await interaction.followup.send("Your lasting timer card is in your DMs. Its controls can recover after a restart.", ephemeral=True)
+        else:
+            embed.set_footer(text="Private controls refresh for 15 minutes. Reopen /study status anytime; /study timer creates a lasting DM timer.")
+            msg = await interaction.followup.send(embed=embed, view=view, ephemeral=True, wait=True)
+            self._private_panels[uid] = (msg, interaction.expires_at)
+        self._session_panel_views[uid] = view
+        await self.bot.db_worker.run(self.bot.db.set_session_live_message, session["id"], msg.channel.id, msg.id, kind="dm" if delivery == "dm" else "ephemeral")
+        if not session.get("is_paused"):
+            self._start_live_task(uid)
+
+    async def _finish_panel(self, session, embed):
+        uid = session["user_id"]
+        panel = self._private_panels.pop(uid, None)
+        try:
+            if session.get("live_kind") == "dm" and session.get("live_channel_id") and session.get("live_message_id"):
+                ch = self.bot.get_channel(session["live_channel_id"]) or await self.bot.fetch_channel(session["live_channel_id"])
+                await ch.get_partial_message(session["live_message_id"]).edit(embed=embed, view=None)
+            elif panel and datetime.now(timezone.utc) < panel[1]:
+                await panel[0].edit(embed=embed, view=None)
+        except discord.HTTPException:
+            log.debug("Completed timer card unavailable", exc_info=True)
+
+    async def _stop_session(self, interaction: discord.Interaction, *, notes: str = "", expected_session_id: int | None = None):
         """Shared stop handler for slash + button/modal stop."""
         if not interaction.response.is_done():
             await interaction.response.defer(ephemeral=True)
         uid = interaction.user.id
         async with self.bot.user_locks[uid]:
-            self.bot.db.ensure_user(uid, str(interaction.user))
-            session = self.bot.db.end_session(uid, notes)
+            active = await self.bot.db_worker.run(self.bot.db.get_active_session, uid)
+            if expected_session_id is not None and (not active or active["id"] != expected_session_id):
+                await interaction.followup.send("This session has already ended. Your current session was left unchanged.", ephemeral=True)
+                return
+            (await self.bot.db_worker.run(lambda: self.bot.db.ensure_user(uid, str(interaction.user))))
+            session = (await self.bot.db_worker.run(lambda: self.bot.db.end_session(uid, notes)))
             if not session:
                 await interaction.followup.send("❌ No active session.", ephemeral=True)
                 return
@@ -458,21 +493,13 @@ class Study(commands.Cog):
                 actual_xp, loot_drops = await self._process_session_rewards(uid, session)
             xp = actual_xp or xp
 
-            user = self.bot.db.get_user(uid)
+            user = (await self.bot.db_worker.run(lambda: self.bot.db.get_user(uid)))
 
-        ch_id, msg_id = session.get("live_channel_id"), session.get("live_message_id")
-        if ch_id and msg_id:
-            async def _update_live_msg():
-                try:
-                    ch = self.bot.get_channel(ch_id) or await self.bot.fetch_channel(ch_id)
-                    ended_embed = discord.Embed(title=f"✅ Session Complete — {session['subject'] or 'General'}", color=0x57F287)
-                    ended_embed.add_field(name="Duration", value=fmt_mins(minutes))
-                    ended_embed.add_field(name="XP", value=f"+{xp}")
-                    ended_embed.add_field(name="Points", value=f"+{points}")
-                    await (await ch.fetch_message(msg_id)).edit(embed=ended_embed, view=None)
-                except Exception:
-                    pass
-            asyncio.create_task(_update_live_msg())
+        ended_embed = discord.Embed(title="Session Complete", color=COLOR_SUCCESS)
+        ended_embed.add_field(name="Duration", value=fmt_mins(minutes))
+        ended_embed.add_field(name="XP", value=f"+{xp}")
+        ended_embed.add_field(name="Points", value=f"+{points}")
+        await self._finish_panel(session, ended_embed)
 
         if minutes < 5:
             await interaction.followup.send("⚠️ Session under 5 min — no rewards. Keep at it!", ephemeral=True)
@@ -502,15 +529,15 @@ class Study(commands.Cog):
             embed.add_field(name="🏅 Bonuses", value="  ".join(bonuses), inline=False)
 
         if session.get("notes"):
-            embed.add_field(name="📝 Notes", value=session["notes"], inline=False)
+            embed.add_field(name="📝 Notes", value=session["notes"][:1000], inline=False)
 
         loot_line = format_loot_summary(loot_drops)
         if loot_line:
             embed.add_field(name="🎁 Lucky loot (this session)", value=loot_line, inline=False)
 
-        goal = self.bot.db.get_today_goal(uid)
+        goal = (await self.bot.db_worker.run(lambda: self.bot.db.get_today_goal(uid)))
         today_iso = datetime.now(EST).date().isoformat()
-        today_mins = self.bot.db.get_study_minutes_on_date(uid, today_iso)
+        today_mins = (await self.bot.db_worker.run(lambda: self.bot.db.get_study_minutes_on_date(uid, today_iso)))
 
         if goal > 0:
             pct = min(int(today_mins / goal * 100), 100)
@@ -528,40 +555,18 @@ class Study(commands.Cog):
 
     async def _live_loop(self, user_id: int):
         try:
-            await asyncio.sleep(30)
-            consecutive_errors = 0
             while True:
-                session = self.bot.db.get_active_session(user_id)
+                await asyncio.sleep(60)
+                session = await self.bot.db_worker.run(self.bot.db.get_active_session, user_id)
                 if not session or session.get("is_paused"):
                     break
-                ch_id = session.get("live_channel_id")
-                msg_id = session.get("live_message_id")
-                if ch_id and msg_id:
-                    try:
-                        ch = self.bot.get_channel(ch_id) or await self.bot.fetch_channel(ch_id)
-                        msg = await ch.fetch_message(msg_id)
-                        view = self._session_panel_views.get(user_id)
-                        await msg.edit(
-                            embed=build_session_embed(
-                                session,
-                                bundle_line=self._session_bundle_line(session),
-                                buff_line=self._session_buff_line(session),
-                            ),
-                            view=view,
-                        )
-                        consecutive_errors = 0
-                    except discord.NotFound:
-                        break
-                    except discord.Forbidden:
-                        break
-                    except Exception as e:
-                        log.debug("Live loop edit error: %s", e)
-                        consecutive_errors += 1
-                        if consecutive_errors >= 5:
-                            break
-                await asyncio.sleep(30)
+                if not await self._edit_live_session_message(user_id, session=session):
+                    break
         except asyncio.CancelledError:
             pass
+        finally:
+            if self.live_tasks.get(user_id) is asyncio.current_task():
+                self.live_tasks.pop(user_id, None)
 
     def _ensure_motivation_task(self, user_id: int):
         task = self.motivation_tasks.get(user_id)
@@ -577,7 +582,7 @@ class Study(commands.Cog):
     async def _motivation_loop(self, user_id: int):
         try:
             while True:
-                session = self.bot.db.get_active_session(user_id)
+                session = (await self.bot.db_worker.run(lambda: self.bot.db.get_active_session(user_id)))
                 if not session or session.get("motivation_sent"):
                     return
                 target = session.get("target_minutes") or 0
@@ -589,11 +594,11 @@ class Study(commands.Cog):
                 active_secs, _ = get_elapsed_and_paused(session)
                 threshold = (target * 60) // 2
                 if active_secs >= threshold:
-                    self.bot.db.set_motivation_sent(session["id"], True)
-                    if self.bot.db.get_dm_enabled(user_id, "study_motivation"):
+                    (await self.bot.db_worker.run(lambda: self.bot.db.set_motivation_sent(session["id"], True)))
+                    if (await self.bot.db_worker.run(lambda: self.bot.db.get_dm_enabled(user_id, "study_motivation"))):
                         sid = int(session["id"])
                         quote = random.choice(MOTIVATIONAL_QUOTES)
-                        self.bot.db.enqueue_outbox(
+                        (await self.bot.db_worker.run(lambda: self.bot.db.enqueue_outbox(
                             target_type="user",
                             target_id=int(user_id),
                             kind="study_motivation",
@@ -611,7 +616,7 @@ class Study(commands.Cog):
                                     }
                                 ],
                             },
-                        )
+                        )))
                     return
                 remaining = max(threshold - active_secs, 0)
                 await asyncio.sleep(min(30, max(10, remaining // 2 or 10)))
@@ -641,7 +646,7 @@ class Study(commands.Cog):
         """After 4 hours total time, send a DM dropdown. Auto-stop after 30m no response."""
         try:
             while True:
-                session = self.bot.db.get_active_session(user_id)
+                session = (await self.bot.db_worker.run(lambda: self.bot.db.get_active_session(user_id)))
                 if not session:
                     return
 
@@ -653,7 +658,7 @@ class Study(commands.Cog):
                     await asyncio.sleep(min(300, max(60, 4 * 3600 - wall_secs)))
                     continue
 
-                if not self.bot.db.get_dm_enabled(user_id, "inactivity_warnings"):
+                if not (await self.bot.db_worker.run(lambda: self.bot.db.get_dm_enabled(user_id, "inactivity_warnings"))):
                     return
 
                 user = await self.bot.get_user_or_fetch(user_id)
@@ -676,7 +681,7 @@ class Study(commands.Cog):
                 await asyncio.sleep(30 * 60)
 
                 if not view.responded:
-                    session = self.bot.db.get_active_session(user_id)
+                    session = (await self.bot.db_worker.run(lambda: self.bot.db.get_active_session(user_id)))
                     if session:
                         await self._auto_stop_session(user_id, "Inactivity auto-stop (30m no response)")
                 return
@@ -688,7 +693,7 @@ class Study(commands.Cog):
     async def _auto_stop_session(self, user_id: int, reason: str = ""):
         """Stops a session outside of a slash command context (e.g., inactivity DM)."""
         async with self.bot.user_locks[user_id]:
-            session = self.bot.db.end_session(user_id, reason)
+            session = (await self.bot.db_worker.run(lambda: self.bot.db.end_session(user_id, reason)))
             if not session:
                 return
 
@@ -710,22 +715,13 @@ class Study(commands.Cog):
         xp_display = int(actual_xp or base_xp)
         pts_display = int(base_points or (minutes if minutes >= 5 else 0))
 
-        # Update the live message (if any) so the UI matches reality.
-        ch_id, msg_id = session.get("live_channel_id"), session.get("live_message_id")
-        if ch_id and msg_id:
-            async def _update_live_msg():
-                try:
-                    ch = self.bot.get_channel(ch_id) or await self.bot.fetch_channel(ch_id)
-                    ended_embed = discord.Embed(title=f"✅ Session Complete — {session['subject'] or 'General'}", color=0x57F287)
-                    ended_embed.add_field(name="Duration", value=fmt_mins(minutes))
-                    ended_embed.add_field(name="XP", value=f"+{xp_display}")
-                    ended_embed.add_field(name="Points", value=f"+{pts_display}")
-                    await (await ch.fetch_message(msg_id)).edit(embed=ended_embed, view=None)
-                except Exception:
-                    pass
-            asyncio.create_task(_update_live_msg())
+        ended_embed = discord.Embed(title="Session Complete", color=COLOR_SUCCESS)
+        ended_embed.add_field(name="Duration", value=fmt_mins(minutes))
+        ended_embed.add_field(name="XP", value=f"+{xp_display}")
+        ended_embed.add_field(name="Points", value=f"+{pts_display}")
+        await self._finish_panel(session, ended_embed)
 
-        if self.bot.db.get_dm_enabled(user_id, "inactivity_warnings"):
+        if (await self.bot.db_worker.run(lambda: self.bot.db.get_dm_enabled(user_id, "inactivity_warnings"))):
             sid = int(session.get("id") or 0)
             embed: dict = {
                 "title": "⏹️ Session Auto-Stopped",
@@ -743,14 +739,14 @@ class Study(commands.Cog):
                     {"name": "🎁 Lucky loot (this session)", "value": loot_line, "inline": False}
                 ]
             if sid > 0:
-                self.bot.db.enqueue_outbox(
+                (await self.bot.db_worker.run(lambda: self.bot.db.enqueue_outbox(
                     target_type="user",
                     target_id=int(user_id),
                     kind="session_auto_stopped",
                     dedupe_key=f"session_autostop:{user_id}:{sid}",
                     settings_key="inactivity_warnings",
                     embed=embed,
-                )
+                )))
 
     async def _process_session_rewards(
         self, user_id: int, session: dict, group_xp_mult: float = 1.0
@@ -762,27 +758,27 @@ class Study(commands.Cog):
 
         # Lite mode: keep time tracking, skip all RPG rewards/systems.
         if getattr(self.bot, "is_lite_user", lambda _uid: False)(user_id):
-            self.bot.db.add_daily_minutes(user_id, minutes)
+            (await self.bot.db_worker.run(lambda: self.bot.db.add_daily_minutes(user_id, minutes)))
             return 0, []
 
         points = session.get("points_earned", minutes)
 
         # Beacon: +200 study pts per hour while an active beacon is up in this session's channel
         live_ch = session.get("live_channel_id")
-        if live_ch and self.bot.db.get_active_beacon(int(live_ch)):
+        if live_ch and (await self.bot.db_worker.run(lambda: self.bot.db.get_active_beacon(int(live_ch)))):
             points += int(minutes * 200 / 60)
 
         # Weekend bonus: +50 pts for first session >=25m on Sat/Sun
         now_est = datetime.now(EST)
         if now_est.weekday() >= 5 and minutes >= 25:
-            user = self.bot.db.get_user(user_id)
+            user = (await self.bot.db_worker.run(lambda: self.bot.db.get_user(user_id)))
             today_str = now_est.date().isoformat()
             if user and user.get("weekend_bonus_date") != today_str:
                 points += 50
-                self.bot.db.set_weekend_bonus_date(user_id, today_str)
+                (await self.bot.db_worker.run(lambda: self.bot.db.set_weekend_bonus_date(user_id, today_str)))
 
         # Award points (1 min = 1 pt, immune to multipliers)
-        self.bot.db.add_points(user_id, points, f"Study: {session.get('subject', 'General')}")
+        (await self.bot.db_worker.run(lambda: self.bot.db.add_points(user_id, points, f"Study: {session.get('subject', 'General')}")))
 
         # Calculate potion XP multiplier (proportional overlap)
         base_xp = int(session["xp_earned"])
@@ -797,15 +793,15 @@ class Study(commands.Cog):
         total_xp = base_xp + bonus_xp
         if group_xp_mult > 1.0:
             total_xp = int(total_xp * group_xp_mult)
-        level_result = self.bot.db.add_xp(user_id, total_xp)
+        level_result = (await self.bot.db_worker.run(lambda: self.bot.db.add_xp(user_id, total_xp)))
 
         # Bounty point payout (scales from the target's session duration; pays BOTH users).
-        bounty_for_target = self.bot.db.get_active_bounty(user_id) if is_allowed_member else None
+        bounty_for_target = (await self.bot.db_worker.run(lambda: self.bot.db.get_active_bounty(user_id))) if is_allowed_member else None
         if bounty_for_target and int(bounty_for_target.get("activated") or 0) == 1 and int(bounty_for_target.get("used") or 0) == 0:
             if bounty_for_target.get("target_id") == user_id:
                 # Claim before payout to prevent double-payout under concurrent reward processing.
                 bounty_id = int(bounty_for_target["id"])
-                if self.bot.db.use_bounty(bounty_id):
+                if (await self.bot.db_worker.run(lambda: self.bot.db.use_bounty(bounty_id))):
                     bonus_pts = 0
                     if minutes >= 60:
                         # 60m => 500. Each additional hour up to 4h => +100, capped at 800.
@@ -813,15 +809,15 @@ class Study(commands.Cog):
                         bonus_pts = min(500 + max(extra_hours, 0) * 100, 800)
                     if bonus_pts > 0:
                         owner_id = int(bounty_for_target["owner_id"])
-                        self.bot.db.add_points(user_id, bonus_pts, "Bounty payout")
-                        self.bot.db.add_points(owner_id, bonus_pts, "Bounty payout")
+                        (await self.bot.db_worker.run(lambda: self.bot.db.add_points(user_id, bonus_pts, "Bounty payout")))
+                        (await self.bot.db_worker.run(lambda: self.bot.db.add_points(owner_id, bonus_pts, "Bounty payout")))
                         badge_cog = self.bot.cogs.get("Badges")
                         if badge_cog:
                             await badge_cog.check_venture_capitalist_badge(user_id, bounty_points=bonus_pts)
                             await badge_cog.check_venture_capitalist_badge(owner_id, bounty_points=bonus_pts)
                         # DM payout notices (respects /settings toggle)
-                        if self.bot.db.get_dm_enabled(user_id, "bounty_payout"):
-                            self.bot.db.enqueue_outbox(
+                        if (await self.bot.db_worker.run(lambda: self.bot.db.get_dm_enabled(user_id, "bounty_payout"))):
+                            (await self.bot.db_worker.run(lambda: self.bot.db.enqueue_outbox(
                                 target_type="user",
                                 target_id=int(user_id),
                                 kind="bounty_payout",
@@ -832,9 +828,9 @@ class Study(commands.Cog):
                                     "description": f"You earned **+{bonus_pts:,}** study points from a bounty payout.",
                                     "color": int(COLOR_GOLD),
                                 },
-                            )
-                        if self.bot.db.get_dm_enabled(owner_id, "bounty_payout"):
-                            self.bot.db.enqueue_outbox(
+                            )))
+                        if (await self.bot.db_worker.run(lambda: self.bot.db.get_dm_enabled(owner_id, "bounty_payout"))):
+                            (await self.bot.db_worker.run(lambda: self.bot.db.enqueue_outbox(
                                 target_type="user",
                                 target_id=int(owner_id),
                                 kind="bounty_payout",
@@ -845,18 +841,18 @@ class Study(commands.Cog):
                                     "description": f"You earned **+{bonus_pts:,}** study points from your bounty sponsor bonus.",
                                     "color": int(COLOR_GOLD),
                                 },
-                            )
+                            )))
 
         badge_cog = self.bot.cogs.get("Badges")
 
         # Daily minutes tracking
-        self.bot.db.add_daily_minutes(user_id, minutes)
+        (await self.bot.db_worker.run(lambda: self.bot.db.add_daily_minutes(user_id, minutes)))
 
         # Seasonal minutes
-        self.bot.db.add_seasonal_minutes(user_id, minutes)
+        (await self.bot.db_worker.run(lambda: self.bot.db.add_seasonal_minutes(user_id, minutes)))
 
         # Raid damage: only sessions started in an allowlisted guild can impact the server raid boss.
-        boss = self.bot.db.get_active_boss()
+        boss = (await self.bot.db_worker.run(lambda: self.bot.db.get_active_boss()))
         raid_badge_ctx: Optional[dict] = None
         source_guild_id = session.get("source_guild_id")
         can_affect_raid = False
@@ -870,9 +866,9 @@ class Study(commands.Cog):
             can_affect_raid = await getattr(self.bot, "is_member_of_allowed_guild", lambda _uid: False)(user_id)
         if can_affect_raid and boss and boss.get("hp_remaining", 0) > 0:
             raw_damage = minutes
-            if live_ch and self.bot.db.get_active_beacon(int(live_ch)):
+            if live_ch and (await self.bot.db_worker.run(lambda: self.bot.db.get_active_beacon(int(live_ch)))):
                 raw_damage = int(raw_damage * 1.5)
-            dmg_res = self.bot.db.add_raid_damage(user_id, boss["id"], raw_damage)
+            dmg_res = (await self.bot.db_worker.run(lambda: self.bot.db.add_raid_damage(user_id, boss["id"], raw_damage)))
             raid_badge_ctx = {
                 "killed": bool(dmg_res.get("killed")),
                 "boss_id": boss["id"],
@@ -891,8 +887,8 @@ class Study(commands.Cog):
                     if paused_total == 0:
                         await quest_cog.track_quest(user_id, "deep_focus", minutes)
                     today_iso = now_est.date().isoformat()
-                    today_mins = self.bot.db.get_study_minutes_on_date(user_id, today_iso)
-                    goal = self.bot.db.get_today_goal(user_id)
+                    today_mins = (await self.bot.db_worker.run(lambda: self.bot.db.get_study_minutes_on_date(user_id, today_iso)))
+                    goal = (await self.bot.db_worker.run(lambda: self.bot.db.get_today_goal(user_id)))
                     if goal > 0 and today_mins >= goal:
                         await quest_cog.track_quest(user_id, "streak_guard")
                 except Exception as e:
@@ -901,9 +897,9 @@ class Study(commands.Cog):
 
         # Weekend freeze earning (study >=20m on Sat/Sun)
         if now_est.weekday() == 5 and minutes >= 20:
-            self.bot.db.earn_weekend_freeze(user_id, "sat")
+            (await self.bot.db_worker.run(lambda: self.bot.db.earn_weekend_freeze(user_id, "sat")))
         elif now_est.weekday() == 6 and minutes >= 20:
-            self.bot.db.earn_weekend_freeze(user_id, "sun")
+            (await self.bot.db_worker.run(lambda: self.bot.db.earn_weekend_freeze(user_id, "sun")))
 
         loot_drops = roll_lucky_loot(minutes)
 
@@ -928,19 +924,19 @@ class Study(commands.Cog):
                     if raid_badge_ctx is not None:
                         boss_id = raid_badge_ctx["boss_id"]
                         if raid_badge_ctx.get("killed"):
-                            for uid in self.bot.db.get_raid_damage_user_ids(boss_id):
+                            for uid in (await self.bot.db_worker.run(lambda: self.bot.db.get_raid_damage_user_ids(boss_id))):
                                 await badge_cog.check_raid_badges(uid, {"killed": True})
-                            lb = self.bot.db.get_raid_leaderboard(boss_id, limit=3)
+                            lb = (await self.bot.db_worker.run(lambda: self.bot.db.get_raid_leaderboard(boss_id, limit=3)))
                             for row in lb[:3]:
                                 await badge_cog.check_mvp_podium_finish(row["user_id"])
-                        total_rd = self.bot.db.get_user_total_raid_damage(user_id)
+                        total_rd = (await self.bot.db_worker.run(lambda: self.bot.db.get_user_total_raid_damage(user_id)))
                         await badge_cog.check_vanguard_badge(user_id, total_rd)
-                daily_total = self.bot.db.get_daily_minutes_today(user_id)
+                daily_total = (await self.bot.db_worker.run(lambda: self.bot.db.get_daily_minutes_today(user_id)))
                 if daily_total >= 480:
                     # Mandatory wellbeing DM: not tied to DM toggles; once per EST day when threshold is crossed.
                     wellbeing_key = "wellbeing_8h_sent_date"
                     today_est = now_est.date().isoformat()
-                    if self.bot.db.get_setting(user_id, wellbeing_key, "") != today_est:
+                    if (await self.bot.db_worker.run(lambda: self.bot.db.get_setting(user_id, wellbeing_key, ""))) != today_est:
                         user = await self.bot.get_user_or_fetch(user_id)
                         if user:
                             embed = discord.Embed(
@@ -954,7 +950,7 @@ class Study(commands.Cog):
                             except discord.Forbidden:
                                 pass
                             else:
-                                self.bot.db.set_setting(user_id, wellbeing_key, today_est)
+                                (await self.bot.db_worker.run(lambda: self.bot.db.set_setting(user_id, wellbeing_key, today_est)))
             except Exception as e:
                 log.warning(f"Post-session notification error: {e}")
         asyncio.create_task(_post_session_notifications())
@@ -968,16 +964,16 @@ class Study(commands.Cog):
             color = rarity_colors.get(drop["rarity"], 0x5865F2)
             title = f"🎁 Lucky Loot! ({drop['rarity'].title()})"
             if drop["type"] == "pts":
-                self.bot.db.add_points(user_id, drop["value"], "Lucky Loot")
+                (await self.bot.db_worker.run(lambda: self.bot.db.add_points(user_id, drop["value"], "Lucky Loot")))
                 desc = f"You found **{drop['value']:,} points**!"
             elif drop["type"] == "potion":
-                self.bot.db.add_inventory_item(user_id, "potion", drop["key"])
+                (await self.bot.db_worker.run(lambda: self.bot.db.add_inventory_item(user_id, "potion", drop["key"])))
                 name = drop["key"].replace("_", " ").title()
                 desc = (
                     f"You found a **{name}**! It's in `/inventory` — drink it with `/use_potion`."
                 )
             elif drop["type"] == "coin":
-                self.bot.db.add_coins(user_id, drop["value"])
+                (await self.bot.db_worker.run(lambda: self.bot.db.add_coins(user_id, drop["value"])))
                 desc = f"You found **{drop['value']} Boss Coin(s)**! 🪙"
             else:
                 continue
@@ -985,15 +981,15 @@ class Study(commands.Cog):
                 f"lucky_loot:{user_id}:{drop['type']}:{drop.get('key', '')}:"
                 f"{drop.get('value', '')}:{drop.get('rarity', '')}:{i}"
             )
-            if self.bot.db.get_dm_enabled(user_id, "lucky_loot"):
-                self.bot.db.enqueue_outbox(
+            if (await self.bot.db_worker.run(lambda: self.bot.db.get_dm_enabled(user_id, "lucky_loot"))):
+                (await self.bot.db_worker.run(lambda: self.bot.db.enqueue_outbox(
                     target_type="user",
                     target_id=int(user_id),
                     kind="lucky_loot",
                     dedupe_key=dk,
                     settings_key="lucky_loot",
                     embed={"title": title, "description": desc, "color": int(color)},
-                )
+                )))
 
     # ──── /study ──────────────────────────────────────────────────────────────
 
@@ -1009,19 +1005,20 @@ class Study(commands.Cog):
         self,
         interaction: discord.Interaction,
         subject: str = "General",
-        target: Optional[int] = None,
+        target: Optional[app_commands.Range[int, 1, 480]] = None,
         tags: str = "",
+        delivery: Literal["private", "dm"] = "private",
     ):
         uid = interaction.user.id
         await interaction.response.defer(ephemeral=True)
         async with self.bot.user_locks[uid]:
-            self.bot.db.ensure_user(uid, str(interaction.user))
+            (await self.bot.db_worker.run(lambda: self.bot.db.ensure_user(uid, str(interaction.user))))
 
             # Note: users are allowed to study while waiting in a Group Pomodoro lobby.
             # The group host starting the session will auto-end any personal session and
             # begin a group-tracked one.
 
-            existing = self.bot.db.get_active_session(uid)
+            existing = (await self.bot.db_worker.run(lambda: self.bot.db.get_active_session(uid)))
             if existing:
                 active_secs, _ = get_elapsed_and_paused(existing)
                 embed = discord.Embed(title="📚 Already Studying!", description=f"Session for **{existing['subject'] or 'General'}** is active.", color=0xFEE75C)
@@ -1032,13 +1029,13 @@ class Study(commands.Cog):
 
             # Study Bounty activation: only for users who are actually in the allowlisted server(s).
             is_allowed_member = await getattr(self.bot, "is_member_of_allowed_guild", lambda _uid: False)(uid)
-            activated_bounty = self.bot.db.activate_pending_bounty_for_target(uid) if is_allowed_member else None
+            activated_bounty = (await self.bot.db_worker.run(lambda: self.bot.db.activate_pending_bounty_for_target(uid))) if is_allowed_member else None
             if activated_bounty:
                 owner_id = activated_bounty["owner_id"]
                 target_user = await self.bot.get_user_or_fetch(uid)
                 target_name = target_user.display_name if target_user else f"User {uid}"
-                if self.bot.db.get_dm_enabled(int(owner_id), "bounty_activated"):
-                    self.bot.db.enqueue_outbox(
+                if (await self.bot.db_worker.run(lambda: self.bot.db.get_dm_enabled(int(owner_id), "bounty_activated"))):
+                    (await self.bot.db_worker.run(lambda: self.bot.db.enqueue_outbox(
                         target_type="user",
                         target_id=int(owner_id),
                         kind="bounty_activated",
@@ -1052,36 +1049,19 @@ class Study(commands.Cog):
                             ),
                             "color": int(COLOR_GOLD),
                         },
-                    )
+                    )))
 
-            session_id = self.bot.db.start_session(
+            session_id = (await self.bot.db_worker.run(lambda: self.bot.db.start_session(
                 uid,
                 subject,
                 target,
                 source_guild_id=interaction.guild_id,
                 allowed_member=is_allowed_member,
                 tags=tags,
-            )
-            session = self.bot.db.get_active_session(uid)
+            )))
+            session = (await self.bot.db_worker.run(lambda: self.bot.db.get_active_session(uid)))
 
-        subject_display = subject[:200] if len(subject) > 200 else subject
-        embed = build_session_embed(
-            session,
-            bundle_line=self._session_bundle_line(session),
-            buff_line=self._session_buff_line(session),
-        )
-        embed.title = f"📚 Session Started — {subject_display}"
-        if target:
-            embed.description = f"Goal: **{fmt_mins(target)}** · You've got this!"
-        embed.set_author(name=str(interaction.user), icon_url=interaction.user.display_avatar.url)
-
-        view = self._session_panel_views.get(uid)
-        if view is None:
-            view = StudySessionControlsView(self, uid)
-            self._session_panel_views[uid] = view
-        msg = await interaction.followup.send(embed=embed, view=view, ephemeral=True, wait=True)
-        self.bot.db.set_session_live_message(session_id, msg.channel.id, msg.id)
-        self._start_live_task(uid)
+        await self._publish_panel(interaction, session, delivery=delivery)
         self._start_inactivity_monitor(uid)
         if target and target >= 10:
             self._ensure_motivation_task(uid)
@@ -1101,18 +1081,18 @@ class Study(commands.Cog):
         uid = interaction.user.id
         await interaction.response.defer(ephemeral=True)
         async with self.bot.user_locks[uid]:
-            session = self.bot.db.get_active_session(uid)
+            session = (await self.bot.db_worker.run(lambda: self.bot.db.get_active_session(uid)))
             if not session:
                 await interaction.followup.send("❌ No active session. Use `/study start` first.", ephemeral=True)
                 return
             if session.get("is_paused"):
                 await interaction.followup.send("⏸️ You’re paused. Resume first, then switch subjects.", ephemeral=True)
                 return
-            ok = self.bot.db.switch_active_session_segment(uid, subject=subject.strip()[:200] or "General", tags=tags)
+            ok = (await self.bot.db_worker.run(lambda: self.bot.db.switch_active_session_segment(uid, subject=subject.strip()[:200] or "General", tags=tags)))
             if not ok:
                 await interaction.followup.send("❌ Couldn’t switch subjects. Try again.", ephemeral=True)
                 return
-            session = self.bot.db.get_active_session(uid)
+            session = (await self.bot.db_worker.run(lambda: self.bot.db.get_active_session(uid)))
             if session:
                 await self._edit_live_session_message(uid, session=session)
         await interaction.followup.send(f"✅ Switched to **{subject.strip()[:200] or 'General'}**.", ephemeral=True)
@@ -1121,8 +1101,8 @@ class Study(commands.Cog):
     async def study_start_subject_autocomplete(
         self, interaction: discord.Interaction, current: str
     ) -> list[app_commands.Choice[str]]:
-        self.bot.db.ensure_user(interaction.user.id, str(interaction.user))
-        sessions = self.bot.db.get_user_sessions(interaction.user.id, limit=50)
+        (await self.bot.db_worker.run(lambda: self.bot.db.ensure_user(interaction.user.id, str(interaction.user))))
+        sessions = (await self.bot.db_worker.run(lambda: self.bot.db.get_user_sessions(interaction.user.id, limit=50)))
         seen: dict[str, int] = {}
         for s in sessions:
             subj = (s.get("subject") or "General").strip()
@@ -1138,53 +1118,11 @@ class Study(commands.Cog):
 
     @study.command(name="pause", description="Pause your session timer")
     async def study_pause(self, interaction: discord.Interaction):
-        uid = interaction.user.id
-        session = self.bot.db.get_active_session(uid)
-        if not session:
-            await interaction.response.send_message("❌ No active session.", ephemeral=True); return
-        if session.get("is_paused"):
-            await interaction.response.send_message("⏸️ Already paused. Use `/study resume`.", ephemeral=True); return
-
-        self.bot.db.pause_session(uid)
-        self._cancel_live_task(uid)
-        session = self.bot.db.get_active_session(uid)
-
-        await self._edit_live_session_message(uid, session=session)
-
-        active_secs, _ = get_elapsed_and_paused(session)
-        embed = discord.Embed(title="⏸️ Session Paused", description="Timer stopped. Resume when ready.", color=0xFEE75C)
-        embed.add_field(name="Active Time So Far", value=fmt_mins(active_secs // 60))
-        embed.set_footer(text="Use /study resume to continue")
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await self._set_paused(interaction, True)
 
     @study.command(name="resume", description="Resume your paused session")
     async def study_resume(self, interaction: discord.Interaction):
-        uid = interaction.user.id
-        session = self.bot.db.get_active_session(uid)
-        if not session:
-            await interaction.response.send_message("❌ No active session.", ephemeral=True); return
-        if not session.get("is_paused"):
-            await interaction.response.send_message("▶️ Session isn't paused!", ephemeral=True); return
-
-        pause_secs = self.bot.db.resume_session(uid)
-        session = self.bot.db.get_active_session(uid)
-
-        await self._edit_live_session_message(uid, session=session)
-
-        self._start_live_task(uid)
-        if (session.get("target_minutes") or 0) >= 10:
-            self._ensure_motivation_task(uid)
-
-        # Quest: pause/resume
-        quest_cog = self.bot.cogs.get("Quests")
-        if quest_cog:
-            await quest_cog.track_quest(uid, "pause_resume")
-
-        embed = discord.Embed(title="▶️ Session Resumed!", description="Timer running again. Let's go! 💪", color=0x57F287)
-        embed.add_field(name="Break Was", value=fmt_secs(pause_secs or 0), inline=True)
-        active_secs, _ = get_elapsed_and_paused(session)
-        embed.add_field(name="Active Time", value=fmt_mins(active_secs // 60), inline=True)
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await self._set_paused(interaction, False)
 
     @study.command(name="stop", description="End your session and collect XP")
     @app_commands.describe(notes="Optional session notes")
@@ -1195,11 +1133,11 @@ class Study(commands.Cog):
     @app_commands.describe(text="Your note")
     async def study_note(self, interaction: discord.Interaction, text: str):
         uid = interaction.user.id
-        if not self.bot.db.add_session_note(uid, text):
+        if not (await self.bot.db_worker.run(lambda: self.bot.db.add_session_note(uid, text))):
             await interaction.response.send_message("❌ No active session.", ephemeral=True); return
         embed = discord.Embed(title="📝 Note Added", description=text, color=0x5865F2)
         await interaction.response.send_message(embed=embed, ephemeral=True)
-        session = self.bot.db.get_active_session(uid)
+        session = (await self.bot.db_worker.run(lambda: self.bot.db.get_active_session(uid)))
         if session:
             await self._edit_live_session_message(uid, session=session)
 
@@ -1210,43 +1148,45 @@ class Study(commands.Cog):
     @study.command(name="extend", description="Add more minutes to your session target")
     @app_commands.describe(minutes="Extra minutes to add")
     async def study_extend(self, interaction: discord.Interaction, minutes: app_commands.Range[int, 5, 480]):
-        new_target = self.bot.db.extend_session_target(interaction.user.id, minutes)
+        new_target = (await self.bot.db_worker.run(lambda: self.bot.db.extend_session_target(interaction.user.id, minutes)))
         if new_target is None:
             await interaction.response.send_message("❌ No active session.", ephemeral=True); return
         if new_target >= 10:
             self._ensure_motivation_task(interaction.user.id)
         embed = discord.Embed(title="⏱️ Target Extended!", description=f"New target: **{fmt_mins(new_target)}**", color=0x57F287)
         await interaction.response.send_message(embed=embed, ephemeral=True)
-        session = self.bot.db.get_active_session(interaction.user.id)
+        session = (await self.bot.db_worker.run(lambda: self.bot.db.get_active_session(interaction.user.id)))
         if session:
             await self._edit_live_session_message(interaction.user.id, session=session)
 
     @study.command(name="status", description="Refresh your live session status")
     async def study_status(self, interaction: discord.Interaction):
-        session = self.bot.db.get_active_session(interaction.user.id)
+        await interaction.response.defer(ephemeral=True)
+        session = await self.bot.db_worker.run(self.bot.db.get_active_session, interaction.user.id)
         if not session:
-            await interaction.response.send_message("📭 No active session. Use `/study start`!", ephemeral=True); return
-        embed = build_session_embed(
-            session,
-            bundle_line=self._session_bundle_line(session),
-            buff_line=self._session_buff_line(session),
-        )
-        uid = interaction.user.id
-        view = self._session_panel_views.get(uid)
-        if view is None:
-            view = StudySessionControlsView(self, uid)
-            self._session_panel_views[uid] = view
-        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
-        msg = await interaction.original_response()
-        self.bot.db.set_session_live_message(session["id"], msg.channel.id, msg.id)
-        if not session.get("is_paused"):
-            self._start_live_task(interaction.user.id)
+            await interaction.followup.send("No active session. Use /study start.", ephemeral=True)
+            return
+        # A fresh private card must not replace a durable DM's stored destination.
+        if session.get("live_kind") == "dm":
+            view = StudySessionControlsView(self, interaction.user.id, session["id"])
+            await interaction.followup.send(embed=await self.bot.db_worker.run(self._build_live_embed, session), view=view, ephemeral=True)
+        else:
+            await self._publish_panel(interaction, session)
+
+    @study.command(name="timer", description="Send a lasting timer with restart-safe controls to your DMs")
+    async def study_timer(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        session = await self.bot.db_worker.run(self.bot.db.get_active_session, interaction.user.id)
+        if not session:
+            await interaction.followup.send("Start a session first with /study start.", ephemeral=True)
+            return
+        await self._publish_panel(interaction, session, delivery="dm")
 
     @study.command(name="history", description="View recent study sessions")
     async def study_history(self, interaction: discord.Interaction):
-        self.bot.db.ensure_user(interaction.user.id, str(interaction.user))
-        sessions = self.bot.db.get_user_sessions(interaction.user.id, limit=8)
-        total = self.bot.db.get_total_study_minutes(interaction.user.id)
+        (await self.bot.db_worker.run(lambda: self.bot.db.ensure_user(interaction.user.id, str(interaction.user))))
+        sessions = (await self.bot.db_worker.run(lambda: self.bot.db.get_user_sessions(interaction.user.id, limit=8)))
+        total = (await self.bot.db_worker.run(lambda: self.bot.db.get_total_study_minutes(interaction.user.id)))
 
         embed = discord.Embed(title="📚 Study History", color=0x5865F2)
         if not sessions:
@@ -1278,14 +1218,14 @@ class Study(commands.Cog):
     async def streak(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         uid = interaction.user.id
-        self.bot.db.ensure_user(uid, str(interaction.user))
+        (await self.bot.db_worker.run(lambda: self.bot.db.ensure_user(uid, str(interaction.user))))
         await self.bot._check_adaptive_goal(uid)
 
-        user = self.bot.db.get_user(uid)
-        total = self.bot.db.get_total_study_minutes(uid)
-        weekly = self.bot.db.get_weekly_study_minutes(uid)
-        avg_rating = self.bot.db.get_average_focus_rating(uid)
-        freezes = self.bot.db.get_freezes(uid)
+        user = (await self.bot.db_worker.run(lambda: self.bot.db.get_user(uid)))
+        total = (await self.bot.db_worker.run(lambda: self.bot.db.get_total_study_minutes(uid)))
+        weekly = (await self.bot.db_worker.run(lambda: self.bot.db.get_weekly_study_minutes(uid)))
+        avg_rating = (await self.bot.db_worker.run(lambda: self.bot.db.get_average_focus_rating(uid)))
+        freezes = (await self.bot.db_worker.run(lambda: self.bot.db.get_freezes(uid)))
 
         s = user["streak"]
         if s>=30:   tier,color="🏆 Legendary",0xFFD700
@@ -1320,8 +1260,8 @@ class Study(commands.Cog):
     @goals.command(name="set", description="Set your default daily study goal")
     @app_commands.describe(minutes="Minutes per day (e.g. 90)")
     async def goals_set(self, interaction: discord.Interaction, minutes: app_commands.Range[int, 5, 720]):
-        self.bot.db.ensure_user(interaction.user.id, str(interaction.user))
-        self.bot.db.set_daily_goal(interaction.user.id, minutes)
+        (await self.bot.db_worker.run(lambda: self.bot.db.ensure_user(interaction.user.id, str(interaction.user))))
+        (await self.bot.db_worker.run(lambda: self.bot.db.set_daily_goal(interaction.user.id, minutes)))
         embed = discord.Embed(title="🎯 Daily Goal Set!", description=f"Your default goal is **{fmt_mins(minutes)}**.", color=0x57F287)
         embed.set_footer(text="Set per-day goals with /goals set-day")
         await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -1338,8 +1278,8 @@ class Study(commands.Cog):
         app_commands.Choice(name="Sunday", value="sun"),
     ])
     async def goals_set_day(self, interaction: discord.Interaction, day: str, minutes: app_commands.Range[int, 0, 720]):
-        self.bot.db.ensure_user(interaction.user.id, str(interaction.user))
-        self.bot.db.set_day_goal(interaction.user.id, day, minutes)
+        (await self.bot.db_worker.run(lambda: self.bot.db.ensure_user(interaction.user.id, str(interaction.user))))
+        (await self.bot.db_worker.run(lambda: self.bot.db.set_day_goal(interaction.user.id, day, minutes)))
         if minutes == 0:
             msg = f"🛌 **{day.capitalize()}** is now a rest day — no goal tracking that day."
         else:
@@ -1349,9 +1289,9 @@ class Study(commands.Cog):
     @goals.command(name="view", description="View all your daily goals")
     async def goals_view(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
-        self.bot.db.ensure_user(interaction.user.id, str(interaction.user))
+        (await self.bot.db_worker.run(lambda: self.bot.db.ensure_user(interaction.user.id, str(interaction.user))))
         await self.bot._check_adaptive_goal(interaction.user.id)
-        user = self.bot.db.get_user(interaction.user.id)
+        user = (await self.bot.db_worker.run(lambda: self.bot.db.get_user(interaction.user.id)))
         default = user["daily_goal_minutes"]
         days = [("Mon","mon"),("Tue","tue"),("Wed","wed"),("Thu","thu"),("Fri","fri"),("Sat","sat"),("Sun","sun")]
         embed = discord.Embed(title="🎯 Your Goals", color=0x5865F2)
@@ -1371,12 +1311,12 @@ class Study(commands.Cog):
 
     @goals.command(name="progress", description="Check today's study progress")
     async def goals_progress(self, interaction: discord.Interaction):
-        self.bot.db.ensure_user(interaction.user.id, str(interaction.user))
+        (await self.bot.db_worker.run(lambda: self.bot.db.ensure_user(interaction.user.id, str(interaction.user))))
         today_iso = datetime.now(EST).date().isoformat()
-        today_mins = self.bot.db.get_study_minutes_on_date(interaction.user.id, today_iso)
-        goal = self.bot.db.get_today_goal(interaction.user.id)
+        today_mins = (await self.bot.db_worker.run(lambda: self.bot.db.get_study_minutes_on_date(interaction.user.id, today_iso)))
+        goal = (await self.bot.db_worker.run(lambda: self.bot.db.get_today_goal(interaction.user.id)))
 
-        active = self.bot.db.get_active_session(interaction.user.id)
+        active = (await self.bot.db_worker.run(lambda: self.bot.db.get_active_session(interaction.user.id)))
         if active:
             active_secs, _ = get_elapsed_and_paused(active)
             today_mins += active_secs // 60
@@ -1449,7 +1389,7 @@ class InactivityView(discord.ui.View):
         await asyncio.sleep(15 * 60)
         study_cog = self.bot.cogs.get("Study")
         if study_cog:
-            session = self.bot.db.get_active_session(self.user_id)
+            session = (await self.bot.db_worker.run(lambda: self.bot.db.get_active_session(self.user_id)))
             if session:
                 study_cog._start_inactivity_monitor(self.user_id)
 
@@ -1479,7 +1419,7 @@ class SessionRatingView(discord.ui.View):
 
     def _make_callback(self, rating: int):
         async def callback(interaction: discord.Interaction):
-            self.bot.db.set_session_rating(self.session_id, rating)
+            (await self.bot.db_worker.run(lambda: self.bot.db.set_session_rating(self.session_id, rating)))
             label = STAR_LABELS.get(rating, "")
             embed = discord.Embed(
                 title=f"{'⭐' * rating} Focus rated: {label}",
@@ -1515,7 +1455,7 @@ class BreakSuggestionView(discord.ui.View):
     @discord.ui.button(label="Start break timer", style=discord.ButtonStyle.secondary, emoji="☕")
     async def start_break(self, interaction: discord.Interaction, button: discord.ui.Button):
         fire_at = datetime.now(timezone.utc) + timedelta(seconds=self.suggested_mins * 60)
-        rid = self.bot.db.add_reminder(self.user_id, "☕ Break over! Time to get back to studying.", fire_at)
+        rid = (await self.bot.db_worker.run(lambda: self.bot.db.add_reminder(self.user_id, "☕ Break over! Time to get back to studying.", fire_at)))
         self.bot._add_reminder_job({"id": rid, "user_id": self.user_id, "message": "☕ Break over!", "fire_at": fire_at})
         embed = discord.Embed(title=f"☕ Break timer started — {self.suggested_mins} min", description="I'll DM you when it's time!", color=0x57F287)
         await interaction.response.edit_message(embed=embed, view=None)

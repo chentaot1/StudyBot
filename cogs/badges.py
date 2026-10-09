@@ -69,20 +69,20 @@ class Badges(commands.Cog):
         self.bot = bot
 
     async def _try_award(self, user_id: int, badge_key: str, tier: int = 1) -> bool:
-        if self.bot.db.award_badge(user_id, badge_key, tier):
+        if (await self.bot.db_worker.run(lambda: self.bot.db.award_badge(user_id, badge_key, tier))):
             info = BADGE_REGISTRY.get(badge_key, {})
             name = info.get("name", badge_key)
             cat = info.get("cat", "")
             emoji = BADGE_EMOJIS.get(cat, "🏅")
 
-            self.bot.db.add_points(
+            (await self.bot.db_worker.run(lambda: self.bot.db.add_points(
                 user_id,
                 BADGE_UNLOCK_POINTS,
                 reason=f"Badge: {name}" + (f" (T{tier})" if tier > 1 else ""),
-            )
+            )))
 
-            if self.bot.db.get_dm_enabled(user_id, "badge_unlocks"):
-                self.bot.db.enqueue_outbox(
+            if (await self.bot.db_worker.run(lambda: self.bot.db.get_dm_enabled(user_id, "badge_unlocks"))):
+                (await self.bot.db_worker.run(lambda: self.bot.db.enqueue_outbox(
                     target_type="user",
                     target_id=int(user_id),
                     kind="badge_unlock",
@@ -107,7 +107,7 @@ class Badges(commands.Cog):
                         ],
                         "footer": "Use /badges to see all your badges!",
                     },
-                )
+                )))
             return True
         return False
 
@@ -123,12 +123,12 @@ class Badges(commands.Cog):
                 await self._try_award(user_id, "marathoner", tier_mins)
 
         # Centurion (100 total hours)
-        total = self.bot.db.get_total_study_minutes(user_id)
+        total = (await self.bot.db_worker.run(lambda: self.bot.db.get_total_study_minutes(user_id)))
         if total >= 6000:
             await self._try_award(user_id, "centurion", 6000)
 
         # Streak Master
-        user = self.bot.db.get_user(user_id)
+        user = (await self.bot.db_worker.run(lambda: self.bot.db.get_user(user_id)))
         if user:
             streak = user["streak"]
             for tier_days in [7, 30, 100, 365]:
@@ -140,37 +140,37 @@ class Badges(commands.Cog):
         started_est = started.replace(tzinfo=timezone.utc).astimezone(EST)
         hour = started_est.hour
         if hour >= 22 or hour < 5:
-            progress = self.bot.db.increment_badge_progress(user_id, "night_owl", minutes)
+            progress = (await self.bot.db_worker.run(lambda: self.bot.db.increment_badge_progress(user_id, "night_owl", minutes)))
             if progress >= 6000:
                 await self._try_award(user_id, "night_owl", 6000)
 
         # Early Bird (5-7AM)
         if 5 <= hour < 7:
-            progress = self.bot.db.increment_badge_progress(user_id, "early_bird", 1)
+            progress = (await self.bot.db_worker.run(lambda: self.bot.db.increment_badge_progress(user_id, "early_bird", 1)))
             if progress >= 50:
                 await self._try_award(user_id, "early_bird", 50)
 
         # Weekend Warrior
         day_of_week = started_est.weekday()
         if day_of_week >= 5:
-            progress = self.bot.db.increment_badge_progress(user_id, "weekend_warrior", minutes)
+            progress = (await self.bot.db_worker.run(lambda: self.bot.db.increment_badge_progress(user_id, "weekend_warrior", minutes)))
             if progress >= 3000:
                 await self._try_award(user_id, "weekend_warrior", 3000)
 
         # The Phantom (Ghost Mode hours)
-        user = self.bot.db.get_user(user_id)
+        user = (await self.bot.db_worker.run(lambda: self.bot.db.get_user(user_id)))
         if user and user.get("ghost_mode"):
-            progress = self.bot.db.increment_badge_progress(user_id, "the_phantom", minutes)
+            progress = (await self.bot.db_worker.run(lambda: self.bot.db.increment_badge_progress(user_id, "the_phantom", minutes)))
             if progress >= 6000:
                 await self._try_award(user_id, "the_phantom", 6000)
 
     async def check_social_badges(self, user_id: int):
-        cheers = self.bot.db.get_cheers_sent(user_id)
+        cheers = (await self.bot.db_worker.run(lambda: self.bot.db.get_cheers_sent(user_id)))
         if cheers >= 50:
             await self._try_award(user_id, "motivator", 50)
 
     async def check_economy_badges(self, user_id: int):
-        user = self.bot.db.get_user(user_id)
+        user = (await self.bot.db_worker.run(lambda: self.bot.db.get_user(user_id)))
         if not user:
             return
 
@@ -179,14 +179,14 @@ class Badges(commands.Cog):
             await self._try_award(user_id, "the_mint", 100000)
 
         coins = user.get("coins", 0)
-        cap = self.bot.db.get_coin_cap(user_id)
+        cap = (await self.bot.db_worker.run(lambda: self.bot.db.get_coin_cap(user_id)))
         if coins >= cap:
             await self._try_award(user_id, "the_whale", 1)
 
-        if self.bot.db.has_gold_jackpot(user_id):
+        if (await self.bot.db_worker.run(lambda: self.bot.db.has_gold_jackpot(user_id))):
             await self._try_award(user_id, "jackpot", 1)
 
-        broker_streak = int(self.bot.db.get_badge_progress(user_id, "the_broker_streak"))
+        broker_streak = int((await self.bot.db_worker.run(lambda: self.bot.db.get_badge_progress(user_id, "the_broker_streak"))))
         if broker_streak >= 7:
             await self._try_award(user_id, "the_broker", 7)
 
@@ -195,7 +195,7 @@ class Badges(commands.Cog):
             await self._try_award(user_id, "the_stimulus", 50)
 
     async def check_prestige_badges(self, user_id: int):
-        p = self.bot.db.get_prestige(user_id)
+        p = (await self.bot.db_worker.run(lambda: self.bot.db.get_prestige(user_id)))
         if p >= 1:
             await self._try_award(user_id, "initiate", 1)
         if p >= 3:
@@ -204,7 +204,7 @@ class Badges(commands.Cog):
             await self._try_award(user_id, "legend", 1)
 
     async def check_srs_badges(self, user_id: int):
-        total_progress = self.bot.db.increment_badge_progress(user_id, "the_scholar_b", 1)
+        total_progress = (await self.bot.db_worker.run(lambda: self.bot.db.increment_badge_progress(user_id, "the_scholar_b", 1)))
         if total_progress >= 100:
             await self._try_award(user_id, "the_scholar_b", 100)
 
@@ -213,13 +213,13 @@ class Badges(commands.Cog):
         await self.check_srs_badges(user_id)
 
         if interval_before_days is not None and interval_before_days >= 30:
-            n = int(self.bot.db.increment_badge_progress(user_id, "deep_roots", 1))
+            n = int((await self.bot.db_worker.run(lambda: self.bot.db.increment_badge_progress(user_id, "deep_roots", 1))))
             if n >= 5:
                 await self._try_award(user_id, "deep_roots", 5)
 
         # Review streak (EST day)
         from datetime import datetime
-        last = self.bot.db.get_setting(user_id, "review_streak_last_date", "")
+        last = (await self.bot.db_worker.run(lambda: self.bot.db.get_setting(user_id, "review_streak_last_date", "")))
         today = datetime.now(EST).date().isoformat()
         if last == today:
             return
@@ -232,16 +232,16 @@ class Badges(commands.Cog):
                 prev_ok = False
         else:
             prev_ok = False
-        cur = int(self.bot.db.get_setting(user_id, "review_streak_count", "0") or 0)
+        cur = int((await self.bot.db_worker.run(lambda: self.bot.db.get_setting(user_id, "review_streak_count", "0"))) or 0)
         cur = (cur + 1) if prev_ok else 1
-        self.bot.db.set_setting(user_id, "review_streak_last_date", today)
-        self.bot.db.set_setting(user_id, "review_streak_count", str(cur))
+        (await self.bot.db_worker.run(lambda: self.bot.db.set_setting(user_id, "review_streak_last_date", today)))
+        (await self.bot.db_worker.run(lambda: self.bot.db.set_setting(user_id, "review_streak_count", str(cur))))
         if cur >= 7:
             await self._try_award(user_id, "review_streak", 7)
 
     async def check_raid_badges(self, user_id: int, boss: dict):
         if boss.get("killed"):
-            progress = self.bot.db.increment_badge_progress(user_id, "boss_slayer", 1)
+            progress = (await self.bot.db_worker.run(lambda: self.bot.db.increment_badge_progress(user_id, "boss_slayer", 1)))
             for t in [1, 4, 10, 20, 35]:
                 if progress >= t:
                     await self._try_award(user_id, "boss_slayer", t)
@@ -252,39 +252,39 @@ class Badges(commands.Cog):
 
     async def check_mvp_podium_finish(self, user_id: int):
         """Call once per raid podium placement (top 3 damage when a boss cycle resolves or is slain)."""
-        n = int(self.bot.db.increment_badge_progress(user_id, "the_mvp", 1))
+        n = int((await self.bot.db_worker.run(lambda: self.bot.db.increment_badge_progress(user_id, "the_mvp", 1))))
         if n >= 5:
             await self._try_award(user_id, "the_mvp", 5)
 
     async def check_sponsor_badge(self, user_id: int):
-        n = int(self.bot.db.increment_badge_progress(user_id, "sponsor", 1))
+        n = int((await self.bot.db_worker.run(lambda: self.bot.db.increment_badge_progress(user_id, "sponsor", 1))))
         if n >= 3:
             await self._try_award(user_id, "sponsor", 3)
 
     async def check_beacon_badge(self, user_id: int):
-        n = int(self.bot.db.increment_badge_progress(user_id, "the_beacon", 1))
+        n = int((await self.bot.db_worker.run(lambda: self.bot.db.increment_badge_progress(user_id, "the_beacon", 1))))
         if n >= 3:
             await self._try_award(user_id, "the_beacon", 3)
 
     async def check_squad_badges_after_group_complete(self, host_id: int, member_user_ids: list[int]):
         """One completed Group Pomodoro session (all cycles done)."""
         for uid in set(member_user_ids):
-            p = int(self.bot.db.increment_badge_progress(uid, "squad_player", 1))
+            p = int((await self.bot.db_worker.run(lambda: self.bot.db.increment_badge_progress(uid, "squad_player", 1))))
             for t in (5, 15, 35, 60, 100):
                 if p >= t:
                     await self._try_award(uid, "squad_player", t)
-        h = int(self.bot.db.increment_badge_progress(host_id, "squad_leader", 1))
+        h = int((await self.bot.db_worker.run(lambda: self.bot.db.increment_badge_progress(host_id, "squad_leader", 1))))
         for t in (5, 20, 50, 100):
             if h >= t:
                 await self._try_award(host_id, "squad_leader", t)
 
     async def check_valiant_pity_badge(self, user_id: int):
-        n = int(self.bot.db.increment_badge_progress(user_id, "valiant_pity", 1))
+        n = int((await self.bot.db_worker.run(lambda: self.bot.db.increment_badge_progress(user_id, "valiant_pity", 1))))
         if n >= 3:
             await self._try_award(user_id, "valiant_pity", 3)
 
     async def check_deg_gambler_badge(self, user_id: int):
-        n = int(self.bot.db.increment_badge_progress(user_id, "degenerate_gambler", 1))
+        n = int((await self.bot.db_worker.run(lambda: self.bot.db.increment_badge_progress(user_id, "degenerate_gambler", 1))))
         if n >= 10:
             await self._try_award(user_id, "degenerate_gambler", 10)
 
@@ -294,7 +294,7 @@ class Badges(commands.Cog):
     async def check_venture_capitalist_badge(self, user_id: int, *, bounty_points: int):
         if bounty_points <= 0:
             return
-        total = self.bot.db.increment_badge_progress(user_id, "venture_capitalist", bounty_points)
+        total = (await self.bot.db_worker.run(lambda: self.bot.db.increment_badge_progress(user_id, "venture_capitalist", bounty_points)))
         if total >= 5000:
             await self._try_award(user_id, "venture_capitalist", 5000)
 
@@ -304,8 +304,8 @@ class Badges(commands.Cog):
             await interaction.response.send_message("Lite mode: RPG features (badges) are disabled for your account.", ephemeral=True)
             return
         uid = interaction.user.id
-        self.bot.db.ensure_user(uid, interaction.user.display_name)
-        earned = self.bot.db.get_badges(uid)
+        (await self.bot.db_worker.run(lambda: self.bot.db.ensure_user(uid, interaction.user.display_name)))
+        earned = (await self.bot.db_worker.run(lambda: self.bot.db.get_badges(uid)))
 
         if not earned:
             await interaction.response.send_message(
@@ -329,7 +329,7 @@ class Badges(commands.Cog):
             emoji = BADGE_EMOJIS.get(cat, "🏅")
             embed.add_field(name=f"{emoji} {cat}", value="\n".join(badges), inline=True)
 
-        featured = self.bot.db.get_featured_badges(uid)
+        featured = (await self.bot.db_worker.run(lambda: self.bot.db.get_featured_badges(uid)))
         if featured:
             feat_names = []
             for fk in featured:
@@ -354,7 +354,7 @@ class Badges(commands.Cog):
             return
         uid = interaction.user.id
         keys = [k for k in [badge1, badge2, badge3] if k]
-        earned = self.bot.db.get_badges(uid)
+        earned = (await self.bot.db_worker.run(lambda: self.bot.db.get_badges(uid)))
         earned_keys = {b["badge_key"] for b in earned}
 
         seen = set()
@@ -367,7 +367,7 @@ class Badges(commands.Cog):
             await interaction.response.send_message("You haven't earned any of those badges yet. Use `/badges` to see what you've unlocked.", ephemeral=True)
             return
 
-        self.bot.db.set_featured_badges(uid, valid)
+        (await self.bot.db_worker.run(lambda: self.bot.db.set_featured_badges(uid, valid)))
         names = [BADGE_REGISTRY.get(k, {}).get("name", k) for k in valid]
         await interaction.response.send_message(
             f"Featured badges set: **{', '.join(names)}**",
@@ -380,12 +380,12 @@ class Badges(commands.Cog):
             await interaction.response.send_message("Lite mode: RPG features (badges) are disabled for your account.", ephemeral=True)
             return
         uid = interaction.user.id
-        self.bot.db.set_featured_badges(uid, [])
+        (await self.bot.db_worker.run(lambda: self.bot.db.set_featured_badges(uid, [])))
         await interaction.response.send_message("Featured badges cleared.", ephemeral=True)
 
     async def _autocomplete_badge(self, interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
-        self.bot.db.ensure_user(interaction.user.id, str(interaction.user))
-        earned = self.bot.db.get_badges(interaction.user.id)
+        (await self.bot.db_worker.run(lambda: self.bot.db.ensure_user(interaction.user.id, str(interaction.user))))
+        earned = (await self.bot.db_worker.run(lambda: self.bot.db.get_badges(interaction.user.id)))
         earned_keys = {b["badge_key"] for b in earned}
         choices = []
         for key in earned_keys:

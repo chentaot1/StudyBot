@@ -30,8 +30,8 @@ class Checkin(commands.Cog):
         enabled: bool,
         hour: app_commands.Range[int, 0, 23] = 20
     ):
-        self.bot.db.ensure_user(interaction.user.id, str(interaction.user))
-        self.bot.db.set_checkin_settings(interaction.user.id, enabled, hour)
+        (await self.bot.db_worker.run(lambda: self.bot.db.ensure_user(interaction.user.id, str(interaction.user))))
+        (await self.bot.db_worker.run(lambda: self.bot.db.set_checkin_settings(interaction.user.id, enabled, hour)))
 
         # Format hour nicely
         ampm_hour = hour % 12 or 12
@@ -63,8 +63,8 @@ class Checkin(commands.Cog):
 
     @checkin.command(name="history", description="View your check-in history (last 14 days)")
     async def checkin_history(self, interaction: discord.Interaction):
-        self.bot.db.ensure_user(interaction.user.id, str(interaction.user))
-        entries = self.bot.db.get_checkin_history_with_study(interaction.user.id, days=14)
+        (await self.bot.db_worker.run(lambda: self.bot.db.ensure_user(interaction.user.id, str(interaction.user))))
+        entries = (await self.bot.db_worker.run(lambda: self.bot.db.get_checkin_history_with_study(interaction.user.id, days=14)))
 
         embed = discord.Embed(title="📋 Check-in History (14 days)", color=COLOR_PRIMARY)
         lines = []
@@ -86,7 +86,7 @@ class Checkin(commands.Cog):
         embed.add_field(name="Studied", value=f"{studied_count}/14 days", inline=True)
         embed.add_field(name="Rate", value=f"{int(studied_count/14*100)}%", inline=True)
 
-        user_data = self.bot.db.get_user(interaction.user.id)
+        user_data = (await self.bot.db_worker.run(lambda: self.bot.db.get_user(interaction.user.id)))
         if user_data and user_data.get("checkin_enabled"):
             hour = user_data.get("checkin_hour", 20)
             ampm_hour = hour % 12 or 12
@@ -100,10 +100,10 @@ class Checkin(commands.Cog):
     @checkin.command(name="now", description="Log today's check-in manually")
     @app_commands.describe(studied="Did you study today?", note="Optional note")
     async def checkin_now(self, interaction: discord.Interaction, studied: bool, note: str = ""):
-        self.bot.db.ensure_user(interaction.user.id, str(interaction.user))
+        (await self.bot.db_worker.run(lambda: self.bot.db.ensure_user(interaction.user.id, str(interaction.user))))
         today = datetime.now(EST).date().isoformat()
-        self.bot.db.record_checkin(interaction.user.id, today, studied, note, restore_streak=studied)
-        user_data = self.bot.db.get_user(interaction.user.id)
+        (await self.bot.db_worker.run(lambda: self.bot.db.record_checkin(interaction.user.id, today, studied, note, restore_streak=studied)))
+        user_data = (await self.bot.db_worker.run(lambda: self.bot.db.get_user(interaction.user.id)))
 
         if studied:
             embed = discord.Embed(title="✅ Check-in logged!", description="Marked as studied today.", color=COLOR_SUCCESS)
@@ -117,8 +117,8 @@ class Checkin(commands.Cog):
     @app_commands.command(name="adaptive", description="Toggle adaptive goal suggestions on or off")
     @app_commands.describe(enabled="On = bot suggests goal adjustments weekly")
     async def adaptive(self, interaction: discord.Interaction, enabled: bool):
-        self.bot.db.ensure_user(interaction.user.id, str(interaction.user))
-        self.bot.db.set_adaptive_goals(interaction.user.id, enabled)
+        (await self.bot.db_worker.run(lambda: self.bot.db.ensure_user(interaction.user.id, str(interaction.user))))
+        (await self.bot.db_worker.run(lambda: self.bot.db.set_adaptive_goals(interaction.user.id, enabled)))
         status = "✅ enabled" if enabled else "❌ disabled"
         embed = discord.Embed(
             title=f"🎯 Adaptive Goals {status}",

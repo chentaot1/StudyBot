@@ -28,6 +28,7 @@ venv/
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.build-tmp/
 .coverage
 htmlcov/
 .cursor/

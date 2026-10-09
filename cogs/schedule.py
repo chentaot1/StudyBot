@@ -4,6 +4,7 @@
 import discord
 from discord import app_commands
 from discord.ext import commands
+from services.scheduling import DEFAULT_TIMEZONE, valid_timezone
 import logging
 
 from constants import EST, COLOR_PRIMARY
@@ -125,7 +126,7 @@ class Schedule(commands.Cog):
 
     sched = app_commands.Group(
         name="schedule",
-        description="Weekly recurring blocks (EST) — DMs at start if enabled in /settings",
+        description="Weekly study blocks in your timezone — reminders follow /settings",
     )
 
     # ── /schedule add ─────────────────────────────────────────────────────────
@@ -134,24 +135,28 @@ class Schedule(commands.Cog):
     @app_commands.describe(
         subject="What you'll be studying",
         days="Days — e.g. MWF · weekdays · daily · Mon,Wed,Fri · Tue/Thu · Saturday",
-        hour="Start hour in EST (0–23)",
-        minute="Start minute in EST (0–59)",
+        hour="Start hour in your saved timezone (0–23)",
+        minute="Start minute (0–59)",
         duration="Duration in minutes (default 60)"
     )
     async def schedule_add(
         self,
         interaction: discord.Interaction,
-        subject: str,
-        days: str,
+        subject: app_commands.Range[str, 0, 100] = "",
+        days: str = "",
         hour: app_commands.Range[int, 0, 23] = 9,
         minute: app_commands.Range[int, 0, 59] = 0,
         duration: app_commands.Range[int, 15, 480] = 60
     ):
-        self.bot.db.ensure_user(interaction.user.id, str(interaction.user))
+        if not subject.strip() or not days.strip():
+            await self.open_schedule_form(interaction)
+            return
+        await interaction.response.defer(ephemeral=True)
+        (await self.bot.db_worker.run(lambda: self.bot.db.ensure_user(interaction.user.id, str(interaction.user))))
 
         parsed = parse_days(days)
         if not parsed:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "❌ Couldn't understand those days. Try:\n"
                 "• `MWF` `TTh` `weekdays` `weekends` `daily`\n"
                 "• `Mon,Wed,Fri` `Tuesday,Thursday` `Saturday`\n"
@@ -160,15 +165,16 @@ class Schedule(commands.Cog):
             )
             return
 
-        existing = self.bot.db.get_user_schedule(interaction.user.id)
+        existing = (await self.bot.db_worker.run(lambda: self.bot.db.get_user_schedule(interaction.user.id)))
         if len(existing) >= 25:
-            await interaction.response.send_message("❌ Max 25 schedule blocks reached.", ephemeral=True)
+            await interaction.followup.send("❌ Max 25 schedule blocks reached.", ephemeral=True)
             return
 
         days_str = ",".join(parsed)
-        block_id = self.bot.db.add_schedule_block(
-            interaction.user.id, subject, days_str, hour, minute, duration
-        )
+        block_id = (await self.bot.db_worker.run(lambda: self.bot.db.add_schedule_block(
+            interaction.user.id, subject, days_str, hour, minute, duration,
+            timezone_name=self.bot.db.get_setting(interaction.user.id, "timezone", DEFAULT_TIMEZONE)
+        )))
 
         end_min = minute + duration
         end_hour = (hour + end_min // 60) % 24
@@ -178,23 +184,32 @@ class Schedule(commands.Cog):
         embed.add_field(name="Subject", value=subject, inline=True)
         embed.add_field(name="Days", value=fmt_days(days_str), inline=True)
         embed.add_field(
-            name="Time (EST)",
+            name="Local start time",
             value=f"{hour:02d}:{minute:02d} – {end_hour:02d}:{end_min:02d}",
             inline=True
         )
         embed.add_field(name="Duration", value=f"{duration} min", inline=True)
         embed.set_footer(
-            text=f"Block #{block_id} • DM at start (EST) — enable “Schedule Reminders” in /settings if needed."
+            text=f"Block #{block_id} • DM at the saved local start time — enable “Schedule Reminders” in /settings if needed."
         )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    async def open_schedule_form(self, interaction):
+        from views.forms import ScheduleModal
+        zone = await self.bot.db_worker.run(self.bot.db.get_setting, interaction.user.id, "timezone", DEFAULT_TIMEZONE)
+        await interaction.response.send_modal(ScheduleModal(self.bot, interaction.user.id, zone))
+
+    @sched.command(name="create", description="Choose study days and times in a guided form")
+    async def schedule_create(self, interaction: discord.Interaction):
+        await self.open_schedule_form(interaction)
 
     # ── /schedule view ────────────────────────────────────────────────────────
 
     @sched.command(name="view", description="View your weekly study schedule (splits across pages if long)")
     async def schedule_view(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
-        self.bot.db.ensure_user(interaction.user.id, str(interaction.user))
-        blocks = self.bot.db.get_user_schedule(interaction.user.id)
+        (await self.bot.db_worker.run(lambda: self.bot.db.ensure_user(interaction.user.id, str(interaction.user))))
+        blocks = (await self.bot.db_worker.run(lambda: self.bot.db.get_user_schedule(interaction.user.id)))
 
         if not blocks:
             await interaction.followup.send(
@@ -223,7 +238,7 @@ class Schedule(commands.Cog):
                 lines.append(
                     f"`#{b['id']}` **{b['subject']}** "
                     f"{b['hour']:02d}:{b['minute']:02d}–{end_hour:02d}:{end_min:02d} "
-                    f"({b['duration_minutes']}min)"
+                    f"({b['duration_minutes']}min · {b.get('timezone') or DEFAULT_TIMEZONE})"
                     + (f" · _{days_display}_" if "·" in days_display or days_display not in ("Every day","Weekdays","Weekends","MWF","Tue/Thu") else "")
                 )
             day_chunks = _chunk_schedule_lines(lines)
@@ -247,7 +262,7 @@ class Schedule(commands.Cog):
             batches.append(batch)
 
         for bi, bfields in enumerate(batches):
-            title = "📅 Your Weekly Schedule (EST)"
+            title = "📅 Your Weekly Schedule"
             if len(batches) > 1:
                 title = f"📅 Your schedule ({bi + 1}/{len(batches)})"
             embed = discord.Embed(title=title, color=COLOR_PRIMARY)
@@ -263,7 +278,7 @@ class Schedule(commands.Cog):
     @app_commands.describe(block_id="Schedule block to remove (from /schedule view)")
     async def schedule_delete(self, interaction: discord.Interaction, block_id: int):
         block = None
-        all_blocks = self.bot.db.get_user_schedule(interaction.user.id)
+        all_blocks = (await self.bot.db_worker.run(lambda: self.bot.db.get_user_schedule(interaction.user.id)))
         for b in all_blocks:
             if b["id"] == block_id:
                 block = b
@@ -271,7 +286,7 @@ class Schedule(commands.Cog):
         if not block:
             await interaction.response.send_message(f"❌ Block `#{block_id}` not found.", ephemeral=True)
             return
-        self.bot.db.delete_schedule_block(block_id, interaction.user.id)
+        (await self.bot.db_worker.run(lambda: self.bot.db.delete_schedule_block(block_id, interaction.user.id)))
         try:
             self.bot.scheduler.remove_job(f"proc_{interaction.user.id}_{block_id}")
         except Exception:
@@ -284,8 +299,8 @@ class Schedule(commands.Cog):
     async def schedule_delete_autocomplete(
         self, interaction: discord.Interaction, current: str
     ) -> list[app_commands.Choice[int]]:
-        self.bot.db.ensure_user(interaction.user.id, str(interaction.user))
-        blocks = self.bot.db.get_user_schedule(interaction.user.id)
+        (await self.bot.db_worker.run(lambda: self.bot.db.ensure_user(interaction.user.id, str(interaction.user))))
+        blocks = (await self.bot.db_worker.run(lambda: self.bot.db.get_user_schedule(interaction.user.id)))
         choices = []
         for b in blocks:
             days_label = fmt_days(b["days_of_week"])

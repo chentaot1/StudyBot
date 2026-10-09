@@ -10,6 +10,7 @@ import string
 import logging
 from datetime import datetime, timezone, timedelta
 from typing import Optional
+from services.scheduling import DEFAULT_TIMEZONE
 
 from constants import (
     EST, BASE_XP, XP_GROWTH, MAX_LEVEL, COIN_EVERY_N_LEVELS,
@@ -509,6 +510,9 @@ class Database:
                 ("study_sessions", "focus_rating",         "INTEGER"),
                 ("study_sessions", "live_channel_id",      "INTEGER"),
                 ("study_sessions", "live_message_id",      "INTEGER"),
+                ("study_sessions", "live_kind", "TEXT DEFAULT 'ephemeral'"),
+                ("schedule_blocks", "timezone", "TEXT DEFAULT '" + DEFAULT_TIMEZONE.replace("'", "''") + "'"),
+                ("tasks", "source_message_url", "TEXT"),
                 ("study_sessions", "motivation_sent",     "INTEGER DEFAULT 0"),
                 ("study_sessions", "points_earned",        "INTEGER DEFAULT 0"),
                 ("study_sessions", "is_group",             "INTEGER DEFAULT 0"),
@@ -639,6 +643,7 @@ class Database:
         target_id: int,
         content: str | None = None,
         embed: dict | None = None,
+        embed_json: str | None = None,
         kind: str | None = None,
         dedupe_key: str | None = None,
         settings_key: str | None = None,
@@ -649,7 +654,11 @@ class Database:
         If `dedupe_key` is provided, this is idempotent (same key inserts once).
         `embed` is a plain dict; the bot reconstructs a discord.Embed at send time.
         """
-        embed_json = json.dumps(embed) if embed is not None else None
+        if embed is not None and embed_json is not None:
+            raise ValueError("Pass embed or embed_json, not both")
+        if embed_json is not None and not isinstance(json.loads(embed_json), dict):
+            raise ValueError("Outbox embed must be a JSON object")
+        embed_json = embed_json if embed_json is not None else (json.dumps(embed) if embed is not None else None)
         with self._conn() as conn:
             if dedupe_key:
                 # Idempotent insert.
@@ -1427,13 +1436,17 @@ class Database:
     ALL_DAYS = list(DAYS_ORDER.keys())
 
     def add_schedule_block(self, user_id: int, subject: str, days_of_week: str,
-                           hour: int, minute: int, duration: int) -> int:
+                           hour: int, minute: int, duration: int, *, timezone_name: str = DEFAULT_TIMEZONE) -> int:
+        from services.scheduling import valid_timezone
+        timezone_name = valid_timezone(timezone_name)
         with self._conn() as conn:
+            if conn.execute("SELECT COUNT(*) FROM schedule_blocks WHERE user_id=?", (user_id,)).fetchone()[0] >= 25:
+                raise ValueError("Max 25 schedule blocks reached.")
             cur = conn.execute(
                 """INSERT INTO schedule_blocks
-                   (user_id, subject, days_of_week, hour, minute, duration_minutes)
-                   VALUES (?,?,?,?,?,?)""",
-                (user_id, subject, days_of_week.lower(), hour, minute, duration)
+                   (user_id, subject, days_of_week, hour, minute, duration_minutes, timezone)
+                   VALUES (?,?,?,?,?,?,?)""",
+                (user_id, subject, days_of_week.lower(), hour, minute, duration, timezone_name)
             )
             return cur.lastrowid
 
@@ -1526,17 +1539,17 @@ class Database:
     def add_task(self, user_id: int, title: str, description: str,
                  points: int, priority: str, due_date: Optional[str],
                  project_id: Optional[int] = None,
-                 is_review: bool = False, review_interval: int = 1) -> int:
+                 is_review: bool = False, review_interval: int = 1, *, source_message_url: str | None = None) -> int:
         next_review = due_date if is_review else None
         with self._conn() as conn:
             next_num = self._next_user_task_num_pending(conn, user_id)
             conn.execute(
                 """INSERT INTO tasks
                    (user_id, user_task_num, project_id, title, description, points, priority, due_date,
-                    is_review, review_interval, next_review_date)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                    is_review, review_interval, next_review_date, source_message_url)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (user_id, next_num, project_id, title, description, points, priority, due_date,
-                 int(is_review), review_interval, next_review)
+                 int(is_review), review_interval, next_review, source_message_url)
             )
             return next_num
 
@@ -1902,11 +1915,11 @@ class Database:
                 "SELECT * FROM study_sessions WHERE ended_at IS NULL"
             ).fetchall()]
 
-    def set_session_live_message(self, session_id: int, channel_id: int, message_id: int):
+    def set_session_live_message(self, session_id: int, channel_id: int, message_id: int, *, kind: str = "ephemeral"):
         with self._conn() as conn:
             conn.execute(
-                "UPDATE study_sessions SET live_channel_id=?, live_message_id=? WHERE id=?",
-                (channel_id, message_id, session_id)
+                "UPDATE study_sessions SET live_channel_id=?, live_message_id=?, live_kind=? WHERE id=?",
+                (channel_id, message_id, kind, session_id)
             )
 
     def set_motivation_sent(self, session_id: int, sent: bool = True):
@@ -1920,9 +1933,9 @@ class Database:
         with self._conn() as conn:
             conn.execute("UPDATE study_sessions SET focus_rating=? WHERE id=?", (rating, session_id))
 
-    def pause_session(self, user_id: int) -> bool:
+    def pause_session(self, user_id: int, *, expected_session_id: int | None = None) -> bool:
         session = self.get_active_session(user_id)
-        if not session or session["is_paused"]:
+        if not session or session["is_paused"] or (expected_session_id is not None and session["id"] != expected_session_id):
             return False
         with self._conn() as conn:
             conn.execute(
@@ -1931,9 +1944,9 @@ class Database:
             )
         return True
 
-    def resume_session(self, user_id: int) -> Optional[int]:
+    def resume_session(self, user_id: int, *, expected_session_id: int | None = None) -> Optional[int]:
         session = self.get_active_session(user_id)
-        if not session or not session["is_paused"]:
+        if not session or not session["is_paused"] or (expected_session_id is not None and session["id"] != expected_session_id):
             return None
         paused_at = _parse_stored(session["paused_at"])
         pause_secs = int((_utcnow_naive() - paused_at).total_seconds())
@@ -1945,9 +1958,9 @@ class Database:
             )
         return pause_secs
 
-    def add_session_note(self, user_id: int, note: str) -> bool:
+    def add_session_note(self, user_id: int, note: str, *, expected_session_id: int | None = None) -> bool:
         session = self.get_active_session(user_id)
-        if not session:
+        if not session or (expected_session_id is not None and session["id"] != expected_session_id):
             return False
         existing = session.get("notes") or ""
         new_notes = (existing + "\n• " + note) if existing else "• " + note
@@ -3445,6 +3458,22 @@ class Database:
                 "SELECT key, value FROM user_settings WHERE user_id=?", (user_id,)
             ).fetchall()
             return {r["key"]: r["value"] for r in rows}
+
+    def save_preferences(self, user_id: int, *, ghost: bool, block_cheers: bool, settings: dict[str, str]):
+        """Save explicit values together; untouched categories stay unchanged."""
+        from services.scheduling import valid_timezone
+        if "timezone" in settings:
+            valid_timezone(settings["timezone"])
+        with self._conn() as conn:
+            conn.execute("UPDATE users SET ghost_mode=?, block_cheers=? WHERE user_id=?", (int(ghost), int(block_cheers), user_id))
+            conn.executemany(
+                "INSERT INTO user_settings (user_id, key, value) VALUES (?,?,?) ON CONFLICT(user_id,key) DO UPDATE SET value=excluded.value",
+                [(user_id, key, value) for key, value in settings.items()],
+            )
+
+    def set_task_source(self, user_id: int, task_number: int, url: str):
+        with self._conn() as conn:
+            conn.execute("UPDATE tasks SET source_message_url=? WHERE user_id=? AND user_task_num=? AND completed=0", (url, user_id, task_number))
 
     def get_dm_enabled(self, user_id: int, dm_type: str) -> bool:
         val = self.get_setting(user_id, f"dm_{dm_type}", "1")

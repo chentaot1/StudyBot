@@ -30,13 +30,13 @@ class Export(commands.Cog):
 
     @app_commands.command(name="export", description="Download all your data as CSV files in a zip")
     async def export(self, interaction: discord.Interaction):
-        self.bot.db.ensure_user(interaction.user.id, str(interaction.user))
+        (await self.bot.db_worker.run(lambda: self.bot.db.ensure_user(interaction.user.id, str(interaction.user))))
         await interaction.response.defer(ephemeral=True)
 
         uid = interaction.user.id
 
         # ── Sessions ──────────────────────────────────────────────────────────
-        sessions = self.bot.db.get_all_sessions(uid)
+        sessions = (await self.bot.db_worker.run(lambda: self.bot.db.get_all_sessions(uid)))
         session_rows = []
         for s in sessions:
             # Convert started_at to EST for readability
@@ -70,7 +70,7 @@ class Export(commands.Cog):
         )
 
         # ── Tasks ─────────────────────────────────────────────────────────────
-        tasks = self.bot.db.get_user_tasks(uid, include_done=True)
+        tasks = (await self.bot.db_worker.run(lambda: self.bot.db.get_user_tasks(uid, include_done=True)))
         task_rows = []
         for t in tasks:
             task_rows.append({
@@ -94,7 +94,7 @@ class Export(commands.Cog):
         )
 
         # ── Point transactions ────────────────────────────────────────────────
-        transactions = self.bot.db.get_point_history(uid, limit=10000)
+        transactions = (await self.bot.db_worker.run(lambda: self.bot.db.get_point_history(uid, limit=10000)))
         tx_rows = []
         for tx in reversed(transactions):
             raw_ca = tx.get("created_at") or ""
@@ -114,7 +114,7 @@ class Export(commands.Cog):
         tx_csv = make_csv(["id","delta","reason","created_at"], tx_rows)
 
         # ── Redemptions ───────────────────────────────────────────────────────
-        redemptions = self.bot.db.get_all_redemptions(uid)
+        redemptions = (await self.bot.db_worker.run(lambda: self.bot.db.get_all_redemptions(uid)))
         redemption_rows = []
         for r in redemptions:
             raw_r = r.get("redeemed_at") or ""
@@ -133,7 +133,7 @@ class Export(commands.Cog):
         redemption_csv = make_csv(["id","reward_name","cost","redeemed_at"], redemption_rows)
 
         # ── Check-ins ─────────────────────────────────────────────────────────
-        checkins = self.bot.db.get_checkin_history(uid, days=365)
+        checkins = (await self.bot.db_worker.run(lambda: self.bot.db.get_checkin_history(uid, days=365)))
         checkin_rows = []
         for c in checkins:
             checkin_rows.append({
@@ -144,7 +144,7 @@ class Export(commands.Cog):
         checkin_csv = make_csv(["date","studied","note"], checkin_rows)
 
         # ── Badges ────────────────────────────────────────────────────────────
-        badges = self.bot.db.get_badges(uid)
+        badges = (await self.bot.db_worker.run(lambda: self.bot.db.get_badges(uid)))
         badge_rows = []
         for b in badges:
             raw_e = b.get("earned_at") or ""
@@ -158,7 +158,7 @@ class Export(commands.Cog):
         badge_csv = make_csv(["badge_key", "tier", "earned_at"], badge_rows)
 
         # ── Gacha ────────────────────────────────────────────────────────────
-        gacha = self.bot.db.get_gacha_history(uid, limit=10000)
+        gacha = (await self.bot.db_worker.run(lambda: self.bot.db.get_gacha_history(uid, limit=10000)))
         gacha_rows = []
         for g in gacha:
             raw_g = g.get("created_at") or ""

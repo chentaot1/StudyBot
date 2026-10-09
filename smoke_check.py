@@ -13,7 +13,7 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 
 def _compileall_product_paths() -> None:
     """H3-style compile: walk product `.py` files; skip ``venv/``, ``.git/``, ``__pycache__/``."""
-    skip_dir = {"venv", ".git", "__pycache__", "node_modules"}
+    skip_dir = {"venv", ".git", "__pycache__", "node_modules", "backups"}
     bad: list[str] = []
     for dirpath, dirnames, filenames in os.walk(ROOT):
         dirnames[:] = [d for d in dirnames if d not in skip_dir and not d.startswith(".")]
@@ -104,6 +104,18 @@ def _schedule_gate_uses_get_dm_enabled_schedule_reminders(gate_fn: ast.AST) -> b
     return False
 
 
+def _unwrap_db_worker(node: ast.AST) -> ast.AST:
+    """Recognize the exact awaited worker/lambda wrapper without weakening the gate check."""
+    if isinstance(node, ast.Await):
+        call = node.value
+        if (isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
+                and call.func.attr == "run" and isinstance(call.func.value, ast.Attribute)
+                and call.func.value.attr == "db_worker" and len(call.args) == 1
+                and isinstance(call.args[0], ast.Lambda)):
+            return call.args[0].body
+    return node
+
+
 def _for_block_in_blocks_loop_has_gate_then_fetch(for_node: ast.For) -> bool:
     """`for block in blocks:` body must gate with `if not self._schedule_block_dms_enabled(...): continue` before DM/fetch."""
     if not isinstance(for_node.target, ast.Name) or for_node.target.id != "block":
@@ -119,9 +131,10 @@ def _for_block_in_blocks_loop_has_gate_then_fetch(for_node: ast.For) -> bool:
     t = gate_if.test
     if not isinstance(t, ast.UnaryOp) or not isinstance(t.op, ast.Not):
         return False
-    if not isinstance(t.operand, ast.Call):
+    operand = _unwrap_db_worker(t.operand)
+    if not isinstance(operand, ast.Call):
         return False
-    fn = t.operand.func
+    fn = operand.func
     if not isinstance(fn, ast.Attribute) or fn.attr != "_schedule_block_dms_enabled":
         return False
     if not isinstance(fn.value, ast.Name) or fn.value.id != "self":
@@ -155,9 +168,10 @@ def _check_proc_block_leads_with_schedule_gate(fn: ast.AST) -> bool:
     t = first.test
     if not isinstance(t, ast.UnaryOp) or not isinstance(t.op, ast.Not):
         return False
-    if not isinstance(t.operand, ast.Call):
+    operand = _unwrap_db_worker(t.operand)
+    if not isinstance(operand, ast.Call):
         return False
-    fn_attr = t.operand.func
+    fn_attr = operand.func
     if not isinstance(fn_attr, ast.Attribute) or fn_attr.attr != "_schedule_block_dms_enabled":
         return False
     if not isinstance(fn_attr.value, ast.Name) or fn_attr.value.id != "self":
@@ -370,10 +384,11 @@ def _has_begin_group_guard(func: ast.AST) -> bool:
 
     for n in ast.walk(func):
         # Capture assignments like: ok = self.bot.db.begin_group_lobby(lobby_id)
-        if isinstance(n, ast.Assign) and isinstance(n.value, ast.Call):
-            chain = _attr_chain(n.value.func)
+        value = _unwrap_db_worker(n.value) if isinstance(n, ast.Assign) else None
+        if isinstance(n, ast.Assign) and isinstance(value, ast.Call):
+            chain = _attr_chain(value.func)
             if chain[-4:] == ["self", "bot", "db", "begin_group_lobby"] or chain[-3:] == ["bot", "db", "begin_group_lobby"]:
-                if n.value.args and isinstance(n.value.args[0], ast.Name) and n.value.args[0].id == "lobby_id":
+                if value.args and isinstance(value.args[0], ast.Name) and value.args[0].id == "lobby_id":
                     for t in n.targets:
                         if isinstance(t, ast.Name):
                             begin_call_targets.add(t.id)
@@ -384,10 +399,11 @@ def _has_begin_group_guard(func: ast.AST) -> bool:
         test = n.test
 
         # Pattern A: if not self.bot.db.begin_group_lobby(lobby_id): return
-        if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not) and isinstance(test.operand, ast.Call):
-            chain = _attr_chain(test.operand.func)
+        operand = _unwrap_db_worker(test.operand) if isinstance(test, ast.UnaryOp) else None
+        if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not) and isinstance(operand, ast.Call):
+            chain = _attr_chain(operand.func)
             if chain[-4:] == ["self", "bot", "db", "begin_group_lobby"] or chain[-3:] == ["bot", "db", "begin_group_lobby"]:
-                if test.operand.args and isinstance(test.operand.args[0], ast.Name) and test.operand.args[0].id == "lobby_id":
+                if operand.args and isinstance(operand.args[0], ast.Name) and operand.args[0].id == "lobby_id":
                     if any(isinstance(b, ast.Return) for b in n.body):
                         return True
 
@@ -587,43 +603,43 @@ def _require_weekly_report_consistency(bot_src: str) -> None:
 
 
 def _require_study_controls_refresh_uses_defer_and_edit(cog_src: str) -> None:
-    """Ensure StudySessionControlsView refresh/pause/resume do not rely on response.edit_message on ephemeral cards."""
-    # Refresh must defer and call _edit_live_session_message.
-    if not re.search(r"class\s+StudySessionControlsView\b", cog_src):
-        return
-    if not re.search(r"def\s+refresh_btn\b", cog_src):
-        fail("cogs/study.py missing StudySessionControlsView.refresh_btn")
-    if not re.search(r"refresh_btn[\s\S]*interaction\.response\.defer\s*\(\s*ephemeral\s*=\s*True\s*\)", cog_src):
-        fail("StudySessionControlsView.refresh_btn must interaction.response.defer(ephemeral=True)")
-    if not re.search(r"refresh_btn[\s\S]*_edit_live_session_message\s*\(", cog_src):
-        fail("StudySessionControlsView.refresh_btn must call _edit_live_session_message(...)")
-    # Only forbid edit_message within refresh_btn itself; other views (e.g. inactivity) legitimately use edit_message.
-    refresh_seg = re.search(r"def\s+refresh_btn\b[\s\S]*?def\s+stop_btn\b", cog_src)
-    if refresh_seg and re.search(r"interaction\.response\.edit_message\s*\(", refresh_seg.group(0)):
-        fail("StudySessionControlsView.refresh_btn must not use interaction.response.edit_message (ephemeral followups are flaky)")
-
-    # Pause/resume should also defer and call _edit_live_session_message.
-    for btn in ("pause_btn", "resume_btn"):
-        if not re.search(rf"def\s+{btn}\b", cog_src):
-            fail(f"cogs/study.py missing StudySessionControlsView.{btn}")
-        if not re.search(rf"{btn}[\s\S]*interaction\.response\.defer\s*\(\s*ephemeral\s*=\s*True\s*\)", cog_src):
-            fail(f"StudySessionControlsView.{btn} must interaction.response.defer(ephemeral=True)")
-        if not re.search(rf"{btn}[\s\S]*_edit_live_session_message\s*\(", cog_src):
-            fail(f"StudySessionControlsView.{btn} must call _edit_live_session_message(...)")
+    """Validate private webhook editing, DM editing and shared pause/resume handling."""
+    tree = ast.parse(cog_src)
+    view = _find_class(tree, "StudySessionControlsView")
+    cog = _find_class(tree, "Study")
+    if view is None or cog is None:
+        fail("Study controls and cog must exist")
+    refresh = _find_function(view, "refresh_btn")
+    if refresh is None or "edit_message" not in _interaction_response_call_names(refresh):
+        fail("Refresh must acknowledge the current interaction by editing its card")
+    for name in ("pause_btn", "resume_btn"):
+        callback = _find_function(view, name)
+        if callback is None or not any(isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "_set_paused" for n in ast.walk(callback)):
+            fail(f"{name} must use the shared state-checked pause/resume handler")
+    handler = _find_function(cog, "_set_paused")
+    if handler is None or "defer" not in _interaction_response_call_names(handler) or not _function_calls_self_method(handler, "_edit_live_session_message"):
+        fail("Pause/resume must acknowledge promptly and refresh the live card")
+    editor = _find_function(cog, "_edit_live_session_message")
+    editor_src = ast.get_source_segment(cog_src, editor) if editor else ""
+    if not editor_src or "_private_panels" not in editor_src or "get_partial_message" not in editor_src or "fetch_message" in editor_src:
+        fail("Private cards must use saved webhook messages, and DM cards must use partial message editing")
 
 
 def _require_zombie_sweeper_guard(bot_src: str) -> None:
-    """Zombie sweeper must only run when there are 0 active sessions (per user request)."""
-    if "Zombie Sweeper" not in bot_src:
-        fail("bot.py missing Zombie Sweeper block (expected startup safeguard)")
-    # Ensure we check active sessions and skip when present.
-    if not re.search(r"active\s*=\s*self\.db\.get_all_active_sessions\s*\(\s*\)", bot_src):
-        fail("Zombie sweeper must query get_all_active_sessions() for guard")
-    if not re.search(r"if\s+active\s*:\s*[\s\S]*Skipping zombie sweeper", bot_src):
-        fail("Zombie sweeper must explicitly skip when active sessions exist")
-    # Ensure kill_zombie_session only happens in the else branch.
-    if not re.search(r"else\s*:\s*[\s\S]*get_zombie_sessions\s*\(", bot_src):
-        fail("Zombie sweeper must only call get_zombie_sessions() when no active sessions exist")
+    """The startup sweeper must skip broken-row cleanup while active sessions exist."""
+    tree = ast.parse(bot_src)
+    cls = _find_class(tree, "StudyBot")
+    ready = _find_function(cls, "on_ready") if cls else None
+    if ready is None:
+        fail("Missing startup recovery")
+    assignment = any(isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "active" for t in n.targets) and any(isinstance(c, ast.Call) and _attr_chain(c.func) == ["self", "db", "get_all_active_sessions"] for c in ast.walk(n.value)) for n in ast.walk(ready))
+    guard = next((n for n in ast.walk(ready) if isinstance(n, ast.If) and isinstance(n.test, ast.Name) and n.test.id == "active"), None)
+    if not assignment or guard is None:
+        fail("Zombie sweeper must query active sessions and guard on them")
+    def contains_call(nodes, method):
+        return any(isinstance(c, ast.Call) and _attr_chain(c.func) == ["self", "db", method] for n in nodes for c in ast.walk(n))
+    if contains_call(guard.body, "get_zombie_sessions") or contains_call(guard.body, "kill_zombie_session") or not contains_call(guard.orelse, "get_zombie_sessions") or not contains_call(guard.orelse, "kill_zombie_session"):
+        fail("Zombie cleanup must occur only in the no-active-sessions branch")
 
 
 def _require_outbox_dm_disabled_defers_without_attempts(db_src: str, bot_src: str) -> None:
@@ -1186,7 +1202,7 @@ def main() -> None:
     _scan_view_button_handlers_for_double_response(os.path.join(ROOT, "cogs", "pomodoro.py"))
     _scan_view_button_handlers_for_double_response(os.path.join(ROOT, "cogs", "study.py"))
 
-    # Live study controls: refresh/pause/resume must defer + edit by fetch_message route.
+    # Live study controls: current-interaction refresh and separate private/DM edit routes.
     study_path = os.path.join(ROOT, "cogs", "study.py")
     with open(study_path, "r", encoding="utf-8") as f:
         study_src = f.read()

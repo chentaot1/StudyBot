@@ -316,7 +316,7 @@ class Admin(commands.Cog):
             pass
 
         # Store message id in channel_config (type key is guild-scoped; value holds message_id).
-        self.bot.db.set_channel(interaction.guild_id, "ping_role_message", msg.id)
+        (await self.bot.db_worker.run(lambda: self.bot.db.set_channel(interaction.guild_id, "ping_role_message", msg.id)))
         await interaction.followup.send(f"✅ Posted. Saved message id `{msg.id}`.", ephemeral=True)
 
     @admin_group.command(name="ping_role_clear", description="Clear the stored SB Ping reaction-role message")
@@ -327,7 +327,7 @@ class Admin(commands.Cog):
         if interaction.guild_id is None:
             await interaction.response.send_message("Use this in the server.", ephemeral=True)
             return
-        self.bot.db.set_channel(interaction.guild_id, "ping_role_message", 0)
+        (await self.bot.db_worker.run(lambda: self.bot.db.set_channel(interaction.guild_id, "ping_role_message", 0)))
         await interaction.response.send_message("✅ Cleared stored ping-role message id.", ephemeral=True)
 
     @admin_group.command(name="usage", description="See whether anyone has used the bot yet")
@@ -483,7 +483,7 @@ class Admin(commands.Cog):
         timestamp = datetime.now(EST).strftime("%Y%m%d_%H%M%S")
         dest = f"backups/study_bot_{timestamp}.db"
         os.makedirs("backups", exist_ok=True)
-        self.bot.db.backup(dest)
+        (await self.bot.db_worker.run(lambda: self.bot.db.backup(dest)))
         await interaction.followup.send(f"✅ Backup saved to `{dest}`", ephemeral=True)
 
     @admin_group.command(name="set_points", description="Set a user's points")
@@ -492,8 +492,8 @@ class Admin(commands.Cog):
         if not self._is_owner(interaction):
             await interaction.response.send_message("Owner only.", ephemeral=True)
             return
-        self.bot.db.ensure_user(user.id, user.display_name)
-        self.bot.db.admin_set_points(user.id, points)
+        (await self.bot.db_worker.run(lambda: self.bot.db.ensure_user(user.id, user.display_name)))
+        (await self.bot.db_worker.run(lambda: self.bot.db.admin_set_points(user.id, points)))
         await interaction.response.send_message(
             f"✅ Set **{user.display_name}**'s points to **{points:,}**.",
             ephemeral=True
@@ -505,8 +505,8 @@ class Admin(commands.Cog):
         if not self._is_owner(interaction):
             await interaction.response.send_message("Owner only.", ephemeral=True)
             return
-        self.bot.db.ensure_user(user.id, user.display_name)
-        self.bot.db.admin_set_streak(user.id, streak)
+        (await self.bot.db_worker.run(lambda: self.bot.db.ensure_user(user.id, user.display_name)))
+        (await self.bot.db_worker.run(lambda: self.bot.db.admin_set_streak(user.id, streak)))
         await interaction.response.send_message(
             f"✅ Set **{user.display_name}**'s streak to **{streak}**.",
             ephemeral=True
@@ -518,9 +518,9 @@ class Admin(commands.Cog):
         if not self._is_owner(interaction):
             await interaction.response.send_message("Owner only.", ephemeral=True)
             return
-        self.bot.db.ensure_user(user.id, user.display_name)
-        self.bot.db.admin_add_coins(user.id, amount)
-        data = self.bot.db.get_user(user.id)
+        (await self.bot.db_worker.run(lambda: self.bot.db.ensure_user(user.id, user.display_name)))
+        (await self.bot.db_worker.run(lambda: self.bot.db.admin_add_coins(user.id, amount)))
+        data = (await self.bot.db_worker.run(lambda: self.bot.db.get_user(user.id)))
         await interaction.response.send_message(
             f"✅ Added **{amount}c** to **{user.display_name}**. New balance: **{data['coins']}c**.",
             ephemeral=True
@@ -533,7 +533,7 @@ class Admin(commands.Cog):
             await interaction.response.send_message("Owner only.", ephemeral=True)
             return
 
-        existing = self.bot.db.get_active_boss()
+        existing = (await self.bot.db_worker.run(lambda: self.bot.db.get_active_boss()))
         if existing:
             await interaction.response.send_message(
                 f"A boss is already active (#{existing['id']}, {existing['hp_remaining']}/{existing['hp']} HP).",
@@ -543,7 +543,7 @@ class Admin(commands.Cog):
 
         if hp <= 0:
             hp = 1200
-        boss = self.bot.db.spawn_boss(hp)
+        boss = (await self.bot.db_worker.run(lambda: self.bot.db.spawn_boss(hp)))
         raid_cog = self.bot.cogs.get("Raid")
         if raid_cog:
             await raid_cog._announce_boss(boss)
@@ -568,7 +568,7 @@ class Admin(commands.Cog):
         if not self._is_owner(interaction):
             await interaction.response.send_message("Owner only.", ephemeral=True)
             return
-        self.bot.db.set_channel(interaction.guild_id, channel_type, channel.id)
+        (await self.bot.db_worker.run(lambda: self.bot.db.set_channel(interaction.guild_id, channel_type, channel.id)))
         await interaction.response.send_message(
             f"✅ **{channel_type}** channel set to {channel.mention}.",
             ephemeral=True
@@ -589,9 +589,9 @@ class Admin(commands.Cog):
         if not self._is_owner(interaction):
             await interaction.response.send_message("Owner only.", ephemeral=True)
             return
-        self.bot.db.ensure_user(user.id, user.display_name)
-        self.bot.db.add_points(user.id, amount, reason=f"Admin grant ({amount})")
-        data = self.bot.db.get_user(user.id)
+        (await self.bot.db_worker.run(lambda: self.bot.db.ensure_user(user.id, user.display_name)))
+        (await self.bot.db_worker.run(lambda: self.bot.db.add_points(user.id, amount, reason=f"Admin grant ({amount})")))
+        data = (await self.bot.db_worker.run(lambda: self.bot.db.get_user(user.id)))
         await interaction.response.send_message(
             f"✅ Added **{amount:,}** points to **{user.display_name}**. Balance: **{data['points']:,}**.",
             ephemeral=True
@@ -603,9 +603,9 @@ class Admin(commands.Cog):
         if not self._is_owner(interaction):
             await interaction.response.send_message("Owner only.", ephemeral=True)
             return
-        self.bot.db.ensure_user(user.id, user.display_name)
-        result = self.bot.db.add_xp(user.id, amount)
-        data = self.bot.db.get_user(user.id)
+        (await self.bot.db_worker.run(lambda: self.bot.db.ensure_user(user.id, user.display_name)))
+        result = (await self.bot.db_worker.run(lambda: self.bot.db.add_xp(user.id, amount)))
+        data = (await self.bot.db_worker.run(lambda: self.bot.db.get_user(user.id)))
         msg = f"✅ Added **{amount:,} XP** to **{user.display_name}**. Level: **{data['level']}**, XP: **{data['xp_current']}/{data.get('total_xp', 0)}**."
         if result.get("level_ups"):
             msg += f"\n🎉 Leveled up to: {', '.join(str(l) for l in result['level_ups'])}"
@@ -633,7 +633,7 @@ class Admin(commands.Cog):
         db_path = self.bot.db.path
         os.makedirs("backups", exist_ok=True)
         timestamp = datetime.now(EST).strftime("%Y%m%d_%H%M%S")
-        self.bot.db.backup(f"backups/pre_wipe_{timestamp}.db")
+        (await self.bot.db_worker.run(lambda: self.bot.db.backup(f"backups/pre_wipe_{timestamp}.db")))
         with sqlite3.connect(db_path) as conn:
             tables = [r[0] for r in conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
@@ -642,7 +642,7 @@ class Admin(commands.Cog):
                 conn.execute(f"DELETE FROM [{t}]")
             conn.execute("DELETE FROM sqlite_sequence")
             conn.commit()
-        self.bot.db.initialize()
+        (await self.bot.db_worker.run(lambda: self.bot.db.initialize()))
         await interaction.response.edit_message(
             embed=discord.Embed(
                 title="✅ Database Wiped",
@@ -693,8 +693,8 @@ class Admin(commands.Cog):
         if not self._is_owner(interaction):
             await interaction.response.send_message("Owner only.", ephemeral=True)
             return
-        self.bot.db.ensure_user(user.id, user.display_name)
-        self.bot.db.add_inventory_item(user.id, item_type, item_key)
+        (await self.bot.db_worker.run(lambda: self.bot.db.ensure_user(user.id, user.display_name)))
+        (await self.bot.db_worker.run(lambda: self.bot.db.add_inventory_item(user.id, item_type, item_key)))
         await interaction.response.send_message(
             f"✅ Gave **{item_key}** ({item_type}) to **{user.display_name}**.",
             ephemeral=True

@@ -58,14 +58,14 @@ class Temptation(commands.Cog):
         url: str | None = None,
     ):
         uid = interaction.user.id
-        self.bot.db.set_setting(uid, "temptation_bundle_enabled", "1")
-        self.bot.db.set_setting(uid, "temptation_bundle_label", label.strip()[:500])
-        self.bot.db.set_setting(uid, "temptation_bundle_rule", rule if rule in ALL_RULES else RULE_POMO_WORK)
-        self.bot.db.set_setting(uid, "temptation_bundle_study_minutes", str(int(study_minutes)))
+        (await self.bot.db_worker.run(lambda: self.bot.db.set_setting(uid, "temptation_bundle_enabled", "1")))
+        (await self.bot.db_worker.run(lambda: self.bot.db.set_setting(uid, "temptation_bundle_label", label.strip()[:500])))
+        (await self.bot.db_worker.run(lambda: self.bot.db.set_setting(uid, "temptation_bundle_rule", rule if rule in ALL_RULES else RULE_POMO_WORK)))
+        (await self.bot.db_worker.run(lambda: self.bot.db.set_setting(uid, "temptation_bundle_study_minutes", str(int(study_minutes)))))
         if url and url.strip():
-            self.bot.db.set_setting(uid, "temptation_bundle_url", url.strip()[:500])
+            (await self.bot.db_worker.run(lambda: self.bot.db.set_setting(uid, "temptation_bundle_url", url.strip()[:500])))
         else:
-            self.bot.db.set_setting(uid, "temptation_bundle_url", "")
+            (await self.bot.db_worker.run(lambda: self.bot.db.set_setting(uid, "temptation_bundle_url", "")))
         await interaction.response.send_message(
             f"✅ **Bundle on.** Treat: **{label.strip()[:200]}**\n"
             f"**When:** {rule_display(rule)}\n"
@@ -76,7 +76,7 @@ class Temptation(commands.Cog):
     @bundle.command(name="clear", description="Disable temptation bundling")
     async def bundle_clear(self, interaction: discord.Interaction):
         uid = interaction.user.id
-        self.bot.db.set_setting(uid, "temptation_bundle_enabled", "0")
+        (await self.bot.db_worker.run(lambda: self.bot.db.set_setting(uid, "temptation_bundle_enabled", "0")))
         await interaction.response.send_message("Bundle cleared.", ephemeral=True)
 
     @bundle.command(name="status", description="Show your bundle settings")
@@ -98,7 +98,7 @@ class Temptation(commands.Cog):
             ephemeral=True,
         )
 
-    def _enqueue_bundle_dm(
+    async def _enqueue_bundle_dm(
         self,
         user_id: int,
         *,
@@ -107,19 +107,19 @@ class Temptation(commands.Cog):
         body: str,
         url: str | None = None,
     ) -> None:
-        if not self.bot.db.get_dm_enabled(user_id, "temptation_bundle"):
+        if not (await self.bot.db_worker.run(lambda: self.bot.db.get_dm_enabled(user_id, "temptation_bundle"))):
             return
         embed: dict = {"title": title, "description": body, "color": int(0xF1C40F)}
         if url:
             embed["fields"] = [{"name": "Link", "value": url[:1024], "inline": False}]
-        self.bot.db.enqueue_outbox(
+        (await self.bot.db_worker.run(lambda: self.bot.db.enqueue_outbox(
             target_type="user",
             target_id=int(user_id),
             kind="temptation_bundle",
             dedupe_key=dedupe_key,
             settings_key="temptation_bundle",
             embed=embed,
-        )
+        )))
 
     async def on_pomodoro_work_complete(self, user_id: int, *, work_segment_key: str) -> None:
         c = bundle_config(self.bot.db, user_id)
@@ -127,7 +127,7 @@ class Temptation(commands.Cog):
             return
         lab = c["label"]
         u = c.get("url") or ""
-        self._enqueue_bundle_dm(
+        (await self._enqueue_bundle_dm(
             user_id,
             dedupe_key=f"temptation_bundle:{user_id}:pomo_work:{work_segment_key}",
             title="🎁 Work block done — treat earned",
@@ -135,7 +135,7 @@ class Temptation(commands.Cog):
                 f"**{lab}**\n_Open this only now — keep it closed during the next focus block._"
             ),
             url=u or None,
-        )
+        ))
 
     async def on_pomodoro_break_started(
         self, user_id: int, break_minutes: int, *, break_segment_key: str
@@ -145,7 +145,7 @@ class Temptation(commands.Cog):
             return
         lab = c["label"]
         u = c.get("url") or ""
-        self._enqueue_bundle_dm(
+        (await self._enqueue_bundle_dm(
             user_id,
             dedupe_key=f"temptation_bundle:{user_id}:pomo_break:{break_segment_key}",
             title="☕ Break started — treat window",
@@ -154,7 +154,7 @@ class Temptation(commands.Cog):
                 "then close it._"
             ),
             url=u or None,
-        )
+        ))
 
     async def on_study_session_end(self, user_id: int, duration_minutes: int, *, session_id: int) -> None:
         c = bundle_config(self.bot.db, user_id)
@@ -167,7 +167,7 @@ class Temptation(commands.Cog):
             return
         lab = c["label"]
         u = c.get("url") or ""
-        self._enqueue_bundle_dm(
+        (await self._enqueue_bundle_dm(
             user_id,
             dedupe_key=f"temptation_bundle:{user_id}:study_end:{session_id}",
             title="🎁 Study session complete — treat earned",
@@ -175,7 +175,7 @@ class Temptation(commands.Cog):
                 f"**{lab}**\n_You hit **{duration_minutes}** min focused (≥{need}). Enjoy mindfully._"
             ),
             url=u or None,
-        )
+        ))
 
 
 async def setup(bot: StudyBot):

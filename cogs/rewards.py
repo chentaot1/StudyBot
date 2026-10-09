@@ -24,9 +24,9 @@ class Rewards(commands.Cog):
     async def _autocomplete_reward_id(
         self, interaction: discord.Interaction, current: str
     ) -> list[app_commands.Choice[int]]:
-        self.bot.db.ensure_user(interaction.user.id, str(interaction.user))
-        rewards = self.bot.db.get_rewards(interaction.user.id)
-        user = self.bot.db.get_user(interaction.user.id)
+        (await self.bot.db_worker.run(lambda: self.bot.db.ensure_user(interaction.user.id, str(interaction.user))))
+        rewards = (await self.bot.db_worker.run(lambda: self.bot.db.get_rewards(interaction.user.id)))
+        user = (await self.bot.db_worker.run(lambda: self.bot.db.get_user(interaction.user.id)))
         choices = []
         for r in rewards:
             can_afford = "✅" if user["points"] >= r["cost"] else "❌"
@@ -50,8 +50,8 @@ class Rewards(commands.Cog):
         cost: app_commands.Range[int, 1, 100000],
         description: str = ""
     ):
-        self.bot.db.ensure_user(interaction.user.id, str(interaction.user))
-        rid = self.bot.db.add_reward(interaction.user.id, name, description, cost)
+        (await self.bot.db_worker.run(lambda: self.bot.db.ensure_user(interaction.user.id, str(interaction.user))))
+        rid = (await self.bot.db_worker.run(lambda: self.bot.db.add_reward(interaction.user.id, name, description, cost)))
         embed = discord.Embed(title="🏪 Reward Added!", color=COLOR_GOLD)
         embed.add_field(name="Reward", value=name, inline=True)
         embed.add_field(name="Cost", value=f"💎 {cost}", inline=True)
@@ -64,9 +64,9 @@ class Rewards(commands.Cog):
 
     @reward.command(name="list", description="Browse your rewards shop")
     async def reward_list(self, interaction: discord.Interaction):
-        self.bot.db.ensure_user(interaction.user.id, str(interaction.user))
-        rewards = self.bot.db.get_rewards(interaction.user.id)
-        user = self.bot.db.get_user(interaction.user.id)
+        (await self.bot.db_worker.run(lambda: self.bot.db.ensure_user(interaction.user.id, str(interaction.user))))
+        rewards = (await self.bot.db_worker.run(lambda: self.bot.db.get_rewards(interaction.user.id)))
+        user = (await self.bot.db_worker.run(lambda: self.bot.db.get_user(interaction.user.id)))
 
         if not rewards:
             await interaction.response.send_message(
@@ -96,14 +96,14 @@ class Rewards(commands.Cog):
     @reward.command(name="redeem", description="Redeem a reward with your points")
     @app_commands.describe(reward_id="Reward to redeem (from /reward list)")
     async def reward_redeem(self, interaction: discord.Interaction, reward_id: int):
-        self.bot.db.ensure_user(interaction.user.id, str(interaction.user))
-        reward = self.bot.db.get_reward(reward_id, interaction.user.id)
+        (await self.bot.db_worker.run(lambda: self.bot.db.ensure_user(interaction.user.id, str(interaction.user))))
+        reward = (await self.bot.db_worker.run(lambda: self.bot.db.get_reward(reward_id, interaction.user.id)))
 
         if not reward:
             await interaction.response.send_message(f"❌ Reward `#{reward_id}` not found.", ephemeral=True)
             return
 
-        user = self.bot.db.get_user(interaction.user.id)
+        user = (await self.bot.db_worker.run(lambda: self.bot.db.get_user(interaction.user.id)))
         if user["points"] < reward["cost"]:
             short = reward["cost"] - user["points"]
             await interaction.response.send_message(
@@ -131,7 +131,7 @@ class Rewards(commands.Cog):
     @reward.command(name="delete", description="Remove a reward from your shop")
     @app_commands.describe(reward_id="Reward to delete")
     async def reward_delete(self, interaction: discord.Interaction, reward_id: int):
-        if self.bot.db.delete_reward(reward_id, interaction.user.id):
+        if (await self.bot.db_worker.run(lambda: self.bot.db.delete_reward(reward_id, interaction.user.id))):
             await interaction.response.send_message(f"🗑️ Reward `#{reward_id}` deleted.", ephemeral=True)
         else:
             await interaction.response.send_message(f"❌ Reward `#{reward_id}` not found.", ephemeral=True)
@@ -146,7 +146,7 @@ class Rewards(commands.Cog):
 
     @reward.command(name="history", description="View your redemption history")
     async def reward_history(self, interaction: discord.Interaction):
-        history = self.bot.db.get_redemption_history(interaction.user.id)
+        history = (await self.bot.db_worker.run(lambda: self.bot.db.get_redemption_history(interaction.user.id)))
         if not history:
             await interaction.response.send_message("No redemptions yet!", ephemeral=True)
             return
@@ -172,9 +172,9 @@ class Rewards(commands.Cog):
         if getattr(self.bot, "is_lite_user", lambda _uid: False)(interaction.user.id):
             await interaction.response.send_message("Lite mode: RPG/economy features are disabled for your account.", ephemeral=True)
             return
-        self.bot.db.ensure_user(interaction.user.id, str(interaction.user))
-        user = self.bot.db.get_user(interaction.user.id)
-        history = self.bot.db.get_point_history(interaction.user.id, limit=8)
+        (await self.bot.db_worker.run(lambda: self.bot.db.ensure_user(interaction.user.id, str(interaction.user))))
+        user = (await self.bot.db_worker.run(lambda: self.bot.db.get_user(interaction.user.id)))
+        history = (await self.bot.db_worker.run(lambda: self.bot.db.get_point_history(interaction.user.id, limit=8)))
 
         embed = discord.Embed(title="💎 Points Balance", color=COLOR_GOLD)
         embed.set_author(name=str(interaction.user), icon_url=interaction.user.display_avatar.url)
@@ -214,7 +214,7 @@ class RedeemView(discord.ui.View):
 
     @discord.ui.button(label="Yes, redeem!", style=discord.ButtonStyle.success, emoji="🎁")
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
-        ok = self.bot.db.redeem_reward(self.user_id, self.reward["id"])
+        ok = (await self.bot.db_worker.run(lambda: self.bot.db.redeem_reward(self.user_id, self.reward["id"])))
         if not ok:
             await interaction.response.edit_message(
                 content="❌ Redemption failed — check your balance.", embed=None, view=None
@@ -222,7 +222,7 @@ class RedeemView(discord.ui.View):
             self.stop()
             return
 
-        user = self.bot.db.get_user(self.user_id)
+        user = (await self.bot.db_worker.run(lambda: self.bot.db.get_user(self.user_id)))
         embed = discord.Embed(
             title="🎉 Enjoy your reward!",
             description=f"**{self.reward['name']}** redeemed!",
