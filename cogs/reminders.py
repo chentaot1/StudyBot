@@ -17,7 +17,7 @@ log = logging.getLogger("StudyBot.Reminders")
 
 def parse_time_est(s: str, timezone_name: str = DEFAULT_TIMEZONE) -> datetime | None:
     """
-    Parse flexible time strings in the saved timezone (Eastern by default):
+    Parse flexible time strings in the saved timezone (deployment timezone when no user preference is saved):
       Relative: 30m, 2h, 1d, 2h30m
       Time of day: 3:30pm, 15:30, tomorrow 9am
       Calendar (US-first): 6/5/2026 1:00pm, 06-05-2026 13:00, then ISO 2026-06-05 1:00pm
@@ -94,14 +94,14 @@ def _parse_time_of_day(s: str, base: datetime) -> datetime | None:
 
 
 def fmt_est(dt: datetime) -> str:
-    """US-readable Eastern timestamp (weekday, month name, MDY, 12h)."""
+    """US-readable timestamp in the deployment timezone (weekday, month name, MDY, 12h)."""
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     est_dt = dt.astimezone(EST)
     h = int(est_dt.strftime("%I"))
     return (
         f"{est_dt.strftime('%A')}, {est_dt.strftime('%B')} {est_dt.day}, {est_dt.year} "
-        f"at {h}{est_dt.strftime(':%M %p')} EST"
+        f"at {h}{est_dt.strftime(':%M %p %Z')}"
     )
 
 

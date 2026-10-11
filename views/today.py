@@ -70,7 +70,7 @@ class TodayView(discord.ui.LayoutView):
         self.bot, self.user_id = bot, uid
         goal, minutes = data["goal"], data["minutes"]
         progress = f"{fmt_mins(minutes)} / {fmt_mins(goal)} · {min(100, minutes * 100 // goal)}%" if goal else f"{fmt_mins(minutes)} studied · set a goal with /goals set"
-        header = discord.ui.Container(discord.ui.TextDisplay("## Today"), discord.ui.TextDisplay(f"**Daily goal:** {progress}\n**Streak:** {data['user']['streak']} days\nStudy totals and due dates use US Eastern (ET)."), accent_colour=COLOR_PRIMARY)
+        header = discord.ui.Container(discord.ui.TextDisplay("## Today"), discord.ui.TextDisplay(f"**Daily goal:** {progress}\n**Streak:** {data['user']['streak']} days\nStudy totals and due dates use {EST.key}."), accent_colour=COLOR_PRIMARY)
         self.add_item(header)
         session = data["session"]
         if session:

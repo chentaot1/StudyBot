@@ -14,7 +14,7 @@ The bot now uses discord.py 2.7.1 and Discord's newer interaction components:
 - `/task create`, `/schedule create`, and `/settings` provide guided forms. `/task add` and `/schedule add` also open forms when their main arguments are omitted. Settings save explicit notification choices, privacy options, and timezone together.
 - Right-click a message → **Apps → Create task** or **Remind me about this** to save it with a link to the original. Access to that message still depends on Discord permissions.
 - `/study start` defaults to private controls. The session continues after the 15-minute private card expires; reopen `/study status` for fresh controls. `/study timer` or `/study start delivery:dm` sends a lasting DM card. DM session controls and group lobby buttons recover their saved identities after restart, and old cards cannot operate on replacement sessions.
-- `/remind at` uses Discord's date/time picker. New weekly blocks and text reminders use each user's IANA timezone from `/settings`, defaulting to the deployment's `TIMEZONE`. Existing blocks retain the deployment timezone during migration and keep their saved timezone when preferences change. Recurring blocks skip nonexistent daylight-saving times and fire once at the first occurrence of a repeated hour. Daily goals and reset boundaries still use the deployment calendar, US Eastern by default.
+- `/remind at` uses Discord's date/time picker. New weekly blocks and text reminders use each user's IANA timezone from `/settings`, defaulting to the deployment's `TIMEZONE`. Existing blocks retain the deployment timezone during migration and keep their saved timezone when preferences change. Recurring blocks skip nonexistent daylight-saving times and fire once at the first occurrence of a repeated hour. Daily goals and reset boundaries use the deployment calendar in the explicitly configured `TIMEZONE`.
 - `/study_plan event` creates a native scheduled study event with RSVPs, optionally in a voice channel. Start `/group_pomo` when it begins; events do not automatically start timers. `/study_plan poll` posts native polls for subjects or meeting times. Both are server-only and check Discord permissions.
 
 Productivity commands support server and user installs and private contexts. Administration, group Pomodoro, study planning, and server RPG commands declare server-only scopes while retaining runtime authorization checks. Database operations run on a serialized worker thread to keep disk work off Discord's event loop.
@@ -104,6 +104,8 @@ py -3.12 -m venv .venv
 Copy-Item .env.example .env
 ```
 
+Edit `.env` and choose `TIMEZONE` before running the bot. The example leaves it blank so each operator must make an explicit choice.
+
 On Linux or macOS, create the environment with `python3.12 -m venv .venv`, then use `.venv/bin/python` for the equivalent install and run commands.
 
 Create a Discord application and bot in the [Discord Developer Portal](https://discord.com/developers/applications). Enable the **Server Members Intent**, which the membership policy requires. The bot does not request Message Content Intent. Selected messages are supplied through Discord message context actions. Install the bot in your server with the `bot` and `applications.commands` scopes. Give it the permissions needed for the features you use, including reading and sending messages, embeds and attachments, message history, and reactions. The optional reaction-role feature also needs Manage Roles and a bot role above the announcement role. Study events and polls need Create Events and Send Polls permissions in the intended channels. Enable user installation in the application settings if you want user-installed productivity commands.
@@ -113,7 +115,7 @@ Edit `.env` locally:
 - `DISCORD_TOKEN`: your bot token.
 - `OWNER_ID`: the Discord user ID allowed to use owner administration commands.
 - `ALLOWED_GUILD_IDS`: the server IDs for this deployment, separated by commas. At least one is required before connecting.
-- `TIMEZONE`: an IANA timezone name; defaults to `America/New_York`. It defines reset boundaries and the default for user schedule/reminder preferences. Some existing labels still refer to Eastern time.
+- `TIMEZONE`: **required**, with no default. Choose a valid IANA timezone, such as `Europe/London`, `Asia/Tokyo`, or `UTC`, in `.env` before starting the bot. Missing, blank, or invalid values prevent startup. This timezone defines daily reset boundaries and the initial timezone for user schedule/reminder preferences.
 - `DB_PATH` and `LOG_DIR`: local database and log locations. Relative paths are resolved from the directory where you start the bot.
 - `LITE_USER_IDS`: optional productivity-only user IDs.
 - `DUO_LEADERBOARD_USER_IDS`: optional IDs for the private duo board, in display order.
@@ -144,13 +146,13 @@ On Windows, `setup.ps1 -Python "C:\path\to\python.exe"` builds `.venv` from the 
 
 ## Verification
 
-StudyBot is a working, self-hosted Discord bot. Automated checks passed **76 tests**, the structural smoke check, a small database simulation, and an offline startup that loaded all 21 feature modules.
+StudyBot is a working, self-hosted Discord bot. Automated checks cover timezone configuration and startup, along with the structural smoke check, a small database simulation, and an offline startup that loaded all 21 feature modules.
 
 Recorded time and focus ratings are user-reported signals. Adaptive goal suggestions are rule-based, and no AI service is required. The bot is self-hosted: the operator controls its database and credentials, and Discord carries the messages and interactions.
 
 ## Running the checks
 
-Run from the repository root in the configured environment:
+Run from the repository root in the configured environment. Pytest explicitly selects `UTC` for its test environment when `TIMEZONE` is unset; the other checks require the deployment timezone to be configured:
 
 ```powershell
 .\.venv\Scripts\python.exe -m pytest -q

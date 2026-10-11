@@ -194,7 +194,7 @@ class Admin(commands.Cog):
         )
         embed.add_field(name="Allowed guild IDs", value=", ".join(str(g) for g in allowed_guilds) or "_none_", inline=False)
         embed.add_field(name="Lite user IDs", value=", ".join(str(u) for u in lite_ids) or "_none_", inline=False)
-        embed.add_field(name="Now (EST)", value=f"`{fmt_datetime_us_est(datetime.now(EST))}`", inline=False)
+        embed.add_field(name="Now (deployment timezone)", value=f"`{fmt_datetime_us_est(datetime.now(EST))}`", inline=False)
 
         if channels:
             embed.add_field(

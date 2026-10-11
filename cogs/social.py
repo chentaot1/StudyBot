@@ -40,7 +40,7 @@ class Social(commands.Cog):
         ok = (await self.bot.db_worker.run(lambda: self.bot.db.send_cheer(uid, target.id)))
         if not ok:
             await interaction.response.send_message(
-                "You've already cheered that person **today (EST)**. Try again tomorrow!",
+                "You've already cheered that person **today (deployment timezone)**. Try again tomorrow!",
                 ephemeral=True,
             )
             return

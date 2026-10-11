@@ -77,18 +77,18 @@ def fmt_date_us_from_iso(iso_date: str) -> str:
 
 
 def fmt_datetime_us_est(dt: datetime, *, with_seconds: bool = False) -> str:
-    """Format an instant in US style (Eastern local time)."""
+    """Format an instant in US style in the deployment timezone."""
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     est = dt.astimezone(EST)
     h = int(est.strftime("%I"))
     if with_seconds:
-        return f"{fmt_date_us(est.date())} {h}:{est.strftime('%M:%S %p')} EST"
-    return f"{fmt_date_us(est.date())} {h}:{est.strftime('%M %p')} EST"
+        return f"{fmt_date_us(est.date())} {h}:{est.strftime('%M:%S %p %Z')}"
+    return f"{fmt_date_us(est.date())} {h}:{est.strftime('%M %p %Z')}"
 
 
 def fmt_weekday_datetime_us_est(dt: datetime) -> str:
-    """Weekday + US date + 12h time in Eastern (session history, etc.)."""
+    """Weekday + US date + 12h time in the deployment timezone (session history, etc.)."""
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     est = dt.astimezone(EST)

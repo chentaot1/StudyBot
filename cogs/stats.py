@@ -271,7 +271,7 @@ class Stats(commands.Cog):
             rank = seasonal_rank_for_minutes(seasonal_mins)
             embed.add_field(name="🏅 Season", value=f"{rank} ({fmt_mins(seasonal_mins)})", inline=True)
 
-        now_est = datetime.now(EST).strftime("%I:%M %p EST")
+        now_est = datetime.now(EST).strftime("%I:%M %p %Z")
         embed.set_footer(text=f"StudyBot • {now_est} • /breakdown for deeper analysis")
         await interaction.followup.send(embed=embed, ephemeral=True)
 
@@ -408,7 +408,7 @@ class Stats(commands.Cog):
 
         embed = discord.Embed(
             title="🧠 Focus Analytics (Last 30 Days)",
-            description="Your study patterns by time of day (EST)",
+            description="Your study patterns by time of day (deployment timezone)",
             color=0x5865F2
         )
 

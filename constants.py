@@ -3,12 +3,12 @@
 
 """Centralized constants for StudyBot RPG. Single source of truth for balance tuning."""
 
-import os
-from env_config import env_ids, env_id
+from env_config import env_ids, env_id, required_timezone
 from zoneinfo import ZoneInfo
 
 # ── Timezone (single source of truth) ─────────────────────────────────────────
-TZ_STR = os.getenv("TIMEZONE", "America/New_York")
+TZ_STR = required_timezone()
+# Legacy variable name; this is the operator's chosen timezone.
 EST = ZoneInfo(TZ_STR)
 
 # ── XP Engine ─────────────────────────────────────────────────────────────────

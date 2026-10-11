@@ -82,7 +82,7 @@ class PreferencesModal(OwnedModal):
             self.notifications.append(self.field(label, discord.ui.CheckboxGroup(required=False, min_values=0, max_values=len(entries), options=[discord.CheckboxGroupOption(label=name, value=key, default=settings.get(f"dm_{key}", "1") == "1") for key, name in entries])))
         self.ghost = self.field("Ghost mode (hide public activity)", discord.ui.Checkbox(default=bool(user.get("ghost_mode"))))
         self.cheers = self.field("Block cheers", discord.ui.Checkbox(default=bool(user.get("block_cheers"))))
-        self.zone = self.field("Timezone for new schedules and reminders", discord.ui.TextInput(default=settings.get("timezone", DEFAULT_TIMEZONE), max_length=100), "Example: America/New_York. Existing blocks keep their timezone.")
+        self.zone = self.field("Timezone for new schedules and reminders", discord.ui.TextInput(default=settings.get("timezone", DEFAULT_TIMEZONE), max_length=100), "Example: Europe/London or Asia/Tokyo. Existing blocks keep their timezone.")
 
     async def on_submit(self, interaction):
         try:

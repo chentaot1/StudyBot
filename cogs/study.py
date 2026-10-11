@@ -1205,7 +1205,7 @@ class Study(commands.Cog):
                     rating_str = f" · {stars}"
                 pts = s.get("points_earned", s.get("duration_minutes", 0))
                 embed.add_field(
-                    name=f"📅 {date_est} EST — {s['subject'] or 'General'}{'📝' if s.get('notes') else ''}",
+                    name=f"📅 {date_est} {EST.key} — {s['subject'] or 'General'}{'📝' if s.get('notes') else ''}",
                     value=f"⏱️ {fmt_mins(s['duration_minutes'])}{paused_note} · ⭐ {s['xp_earned']} XP · 💎 {pts} pts{rating_str}",
                     inline=False
                 )

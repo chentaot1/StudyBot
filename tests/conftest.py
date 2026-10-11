@@ -3,8 +3,12 @@
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
+
+# Explicit test configuration only; production must choose its own timezone.
+os.environ.setdefault("TIMEZONE", "UTC")
 
 # Ensure the repository root is importable in tests (so `import database` works).
 ROOT = Path(__file__).resolve().parents[1]

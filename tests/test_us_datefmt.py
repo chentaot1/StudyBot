@@ -3,6 +3,7 @@
 
 """US date display helpers and due-date parsing."""
 from datetime import date, datetime, timezone
+from zoneinfo import ZoneInfo
 
 from constants import EST
 from utils import fmt_date_us, fmt_date_us_from_iso, fmt_datetime_us_est, fmt_long_date_us, parse_due_date
@@ -36,3 +37,12 @@ def test_fmt_datetime_us_est():
     s2 = fmt_datetime_us_est(dt_utc)
     assert "06/05/2026" in s2
     assert "PM" in s2 or "AM" in s2
+
+
+def test_datetime_label_follows_chosen_timezone_and_dst(monkeypatch):
+    import utils
+    monkeypatch.setattr(utils, "EST", ZoneInfo("Europe/London"))
+    summer = datetime(2026, 6, 5, 12, 0, tzinfo=timezone.utc)
+    winter = datetime(2026, 1, 5, 12, 0, tzinfo=timezone.utc)
+    assert utils.fmt_datetime_us_est(summer).endswith("1:00 PM BST")
+    assert utils.fmt_datetime_us_est(winter).endswith("12:00 PM GMT")

@@ -105,7 +105,7 @@ class StudyBot(commands.Bot):
         os.makedirs(os.path.dirname(db_path) if os.path.dirname(db_path) else ".", exist_ok=True)
         self.db = Database(db_path)
         self.db_worker = DatabaseWorker()
-        self.scheduler = AsyncIOScheduler(timezone="America/New_York")
+        self.scheduler = AsyncIOScheduler(timezone=EST)
         self.owner_id: int = int(os.getenv("OWNER_ID", "0"))
         self.allowed_guild_ids: set[int] | None = _parse_allowed_guild_ids()
         if self.allowed_guild_ids:
@@ -659,7 +659,7 @@ class StudyBot(commands.Bot):
             )
 
     async def _send_reminder(self, reminder_id: int, user_id: int, message: str):
-        now_est = datetime.now(EST).strftime("%I:%M %p EST")
+        now_est = datetime.now(EST).strftime("%I:%M %p %Z")
         (await self.db_worker.run(lambda: self.db.enqueue_outbox(
             target_type="user",
             target_id=int(user_id),
@@ -909,7 +909,7 @@ class StudyBot(commands.Bot):
 
     async def _daily_reset(self):
         try:
-            log.info("Daily reset (midnight EST)...")
+            log.info("Daily reset (midnight in the deployment timezone)...")
             async with self.state_lock:
                 (await self.db_worker.run(lambda: self.db.reset_daily_progress()))
                 (await self.db_worker.run(lambda: self.db.update_streaks()))
@@ -1663,7 +1663,7 @@ class StudyBot(commands.Bot):
                 owner = await self.get_user_or_fetch(self.owner_id)
                 if not owner:
                     return
-                now_est_str = datetime.now(EST).strftime("%I:%M %p EST")
+                now_est_str = datetime.now(EST).strftime("%I:%M %p %Z")
                 active = (await self.db_worker.run(lambda: self.db.get_all_active_sessions()))
                 pomo_active = (await self.db_worker.run(lambda: self.db.get_all_active_pomodoros()))
                 boss = (await self.db_worker.run(lambda: self.db.get_active_boss()))
@@ -1703,7 +1703,7 @@ class CheckinView(discord.ui.View):
             try:
                 await self.message.edit(
                     embed=discord.Embed(
-                        description="⏰ Check-in window closed (midnight EST).",
+                        description="⏰ Check-in window closed (midnight in the deployment timezone).",
                         color=0x747F8D
                     ),
                     view=None
@@ -1729,7 +1729,7 @@ class CheckinView(discord.ui.View):
                         "Even `/study start` for 10 minutes counts! 📚",
             color=0xFEE75C
         )
-        embed.set_footer(text="Streak resets at midnight EST if no session is recorded")
+        embed.set_footer(text="Streak resets at midnight in the deployment timezone if no session is recorded")
         await interaction.response.edit_message(embed=embed, view=None)
         self.stop()
 
@@ -1842,12 +1842,12 @@ def _build_help_embed(topic_index: int, *, is_lite: bool) -> discord.Embed:
     preamble = _help_preamble_fields(is_lite=is_lite)
     sections = _help_command_sections(is_lite=is_lite)
     footer = (
-        f"Weekly report: opt in via /settings (Sun 6pm EST) • Morning briefing midnight EST • "
+        f"Weekly report: opt in via /settings (Sun 6pm, deployment timezone) • Morning briefing midnight, deployment timezone • "
         f"Raids ~2 weeks • {USER_NAV_FOOTER}"
     )
     embed = discord.Embed(
         title="📚 StudyBot — Help",
-        description="Schedules and reminders use your saved timezone. Daily goals, streaks, and resets use US Eastern. Open `/today` for your interactive dashboard.",
+        description="Schedules and reminders use your saved timezone. Daily goals, streaks, and resets use the deployment timezone. Open `/today` for your interactive dashboard.",
         color=0x5865F2,
     )
     if topic_index == 0:

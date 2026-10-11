@@ -15,7 +15,7 @@ def valid_timezone(name: str) -> str:
     try:
         ZoneInfo(name)
     except (ZoneInfoNotFoundError, ValueError) as exc:
-        raise ValueError("Use an IANA timezone such as America/New_York or Europe/London.") from exc
+        raise ValueError("Use an IANA timezone such as Europe/London or Asia/Tokyo.") from exc
     return name
 
 

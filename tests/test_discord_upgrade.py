@@ -15,7 +15,7 @@ import pytest
 
 from database import Database
 from services.db_worker import DatabaseWorker
-from services.scheduling import due_blocks, next_block, occurrence, valid_timezone
+from services.scheduling import DEFAULT_TIMEZONE, due_blocks, next_block, occurrence, valid_timezone
 
 
 @pytest.fixture
@@ -53,7 +53,7 @@ def test_schedule_timezone_and_next_week(db):
     assert due_blocks([block], datetime(2026, 10, 12, 8, 0, tzinfo=timezone.utc))[0]["starts_at"].hour == 8
 
 
-def test_schedule_default_migration_preserves_eastern(db):
+def test_schedule_default_migration_preserves_deployment_timezone(db):
     block_id = db.add_schedule_block(1, "Legacy", "monday", 9, 0, 60)
     session_id = db.start_session(1, "Legacy study")
     task_id = db.add_task(1, "Legacy task", "", 10, "medium", None)
@@ -67,7 +67,7 @@ def test_schedule_default_migration_preserves_eastern(db):
     block = db.get_user_schedule(1)[0]
     session = db.get_active_session(1)
     task = db.get_user_tasks(1)[0]
-    assert block["id"] == block_id and block["timezone"] == "America/New_York"
+    assert block["id"] == block_id and block["timezone"] == DEFAULT_TIMEZONE
     assert session["id"] == session_id and session["live_kind"] == "ephemeral"
     assert task["user_task_num"] == task_id and task["source_message_url"] is None
     with pytest.raises(ValueError):
@@ -79,7 +79,7 @@ def test_explicit_preferences_are_atomic_and_keep_existing_blocks(db):
     db.save_preferences(1, ghost=True, block_cheers=True, settings={"timezone": "Europe/London", "dm_schedule_reminders": "0"})
     assert db.get_user(1)["ghost_mode"] == 1
     assert not db.get_dm_enabled(1, "schedule_reminders")
-    assert db.get_user_schedule(1)[0]["timezone"] == "America/New_York"
+    assert db.get_user_schedule(1)[0]["timezone"] == DEFAULT_TIMEZONE
     with pytest.raises(ValueError):
         db.save_preferences(1, ghost=False, block_cheers=False, settings={"timezone": "Invalid/Zone"})
     assert db.get_user(1)["ghost_mode"] == 1
@@ -430,6 +430,7 @@ def test_full_bootstrap_and_command_scopes_without_discord_login(tmp_path, monke
     from bot import StudyBot
     async def run():
         bot = StudyBot()
+        assert str(bot.scheduler.timezone) == DEFAULT_TIMEZONE
         bot.scheduler.start = Mock()
         try:
             await bot.setup_hook()

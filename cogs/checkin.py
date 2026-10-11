@@ -22,7 +22,7 @@ class Checkin(commands.Cog):
     @checkin.command(name="settings", description="Configure your evening check-in")
     @app_commands.describe(
         enabled="Turn evening check-ins on or off",
-        hour="Hour to receive check-in DM (EST, 0-23). Default 20 = 8pm."
+        hour="Hour to receive check-in DM (deployment timezone, 0-23). Default 20 = 8pm."
     )
     async def checkin_settings(
         self,
@@ -36,7 +36,7 @@ class Checkin(commands.Cog):
         # Format hour nicely
         ampm_hour = hour % 12 or 12
         ampm = "AM" if hour < 12 else "PM"
-        time_str = f"{ampm_hour}:00 {ampm} EST"
+        time_str = f"{ampm_hour}:00 {ampm} {EST.key}"
 
         if enabled:
             embed = discord.Embed(
@@ -91,7 +91,7 @@ class Checkin(commands.Cog):
             hour = user_data.get("checkin_hour", 20)
             ampm_hour = hour % 12 or 12
             ampm = "AM" if hour < 12 else "PM"
-            embed.set_footer(text=f"Check-in at {ampm_hour}:00 {ampm} EST • ✅=studied ⬜=no data 📅=today")
+            embed.set_footer(text=f"Check-in at {ampm_hour}:00 {ampm} {EST.key} • ✅=studied ⬜=no data 📅=today")
         else:
             embed.set_footer(text="Check-ins off. Enable with /checkin settings • ✅=studied ⬜=no data")
 

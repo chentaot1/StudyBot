@@ -63,7 +63,7 @@ def _overview_blocks() -> dict[str, str]:
         ),
         "timezone": (
             "Calendar-style features (**streaks**, **daily goals**, **schedule**, **weekly report** windows) use "
-            "**US Eastern (EST/EDT)** unless a command’s embed says otherwise."
+            "**the deployment timezone** unless a command’s embed says otherwise."
         ),
         "nav_footer": f"Pick a **chapter** below anytime. {USER_NAV_FOOTER}",
     }
@@ -105,7 +105,7 @@ def _overview_blocks_lite() -> dict[str, str]:
         ),
         "timezone": (
             "Calendar-style features (**streaks**, **daily goals**, **schedule**, **weekly report** windows) use "
-            "**US Eastern (EST/EDT)** unless a command’s embed says otherwise."
+            "**the deployment timezone** unless a command’s embed says otherwise."
         ),
         "nav_footer": f"Pick a **chapter** below anytime. {USER_NAV_FOOTER}",
     }
@@ -405,7 +405,7 @@ def _embed(idx: int, *, is_lite: bool = False) -> discord.Embed:
                 value=(
                     "These use your numeric **prestige** row, not mystery rolls:\n"
                     "**P1+** — each `/convert` costs **1,800** study points per coin (**2,000** at **P0**).\n"
-                    "**P3+** — up to **3** successful point→coin **conversions** per **EST** day (**1**/day before that).\n"
+                    "**P3+** — up to **3** successful point→coin **conversions** per day in **the deployment timezone** (**1**/day before that).\n"
                     "**P4+** — `/convert` **daily cap effectively removed**; **boss-coin wallet** cap rises from **50** "
                     "to **100** coins.\n"
                     "**P5** — while stuck at **Level 50**, **banked XP** can grow to a **much higher ceiling** than at "
@@ -418,7 +418,7 @@ def _embed(idx: int, *, is_lite: bool = False) -> discord.Embed:
                 value=(
                     "**P1 — Resilient** — **Emergency Save** costs **2c** instead of **3c** (same Mon–Fri / empty-freeze "
                     "rules).\n"
-                    "**P2 — Tactician** — `/quest reroll` once per EST day (see Quests chapter).\n"
+                    "**P2 — Tactician** — `/quest reroll` once per day in the deployment timezone (see Quests chapter).\n"
                     "**P2 — Scavenger** — extra **raid participation** loot rolls when you are **not** on the podium "
                     "(raid resolution code), plus a safety roll for some edge cases.\n"
                     "**P3 — Time Lord** — potion buff **duration doubles**; **Beacon** runs **4 hours** instead of **2**.\n"
@@ -483,8 +483,8 @@ def _embed(idx: int, *, is_lite: bool = False) -> discord.Embed:
             .add_field(
                 name="`/quest reroll`",
                 value=(
-                    "Requires **Prestige 2 — Tactician** perk. Pick tier **1–3** to replace that row once per **EST "
-                    "day** (bot enforces daily key). Fails softly if quest already complete or perk missing."
+                    "Requires **Prestige 2 — Tactician** perk. Pick tier **1–3** to replace that row once per day in **the deployment "
+                    "timezone** (bot enforces daily key). Fails softly if quest already complete or perk missing."
                 ),
                 inline=False,
             )
@@ -591,7 +591,7 @@ def _embed(idx: int, *, is_lite: bool = False) -> discord.Embed:
         return (
             discord.Embed(
                 title="🤝 Chapter — Social, streaks, goals, check-ins",
-                description="Light accountability + calendar math (everything still **EST**-anchored).",
+                description="Light accountability + calendar math (dates follow **the deployment timezone**).",
                 color=TUTORIAL_COLOR,
             )
             .add_field(
@@ -609,7 +609,7 @@ def _embed(idx: int, *, is_lite: bool = False) -> discord.Embed:
                 name="`/streak`",
                 value=(
                     "Shows current streak tier, freezes, weekend bonuses, and guard rails. Read the embed footers "
-                    "for how midnight EST rolls streak days."
+                    "for how midnight in the deployment timezone rolls streak days."
                 ),
                 inline=False,
             )
@@ -626,7 +626,7 @@ def _embed(idx: int, *, is_lite: bool = False) -> discord.Embed:
             .add_field(
                 name="`/checkin` …",
                 value=(
-                    "`/checkin settings` — enable/disable + pick **hour (0–23 EST)** for the nightly DM.\n"
+                    "`/checkin settings` — enable/disable + pick **hour (0–23, deployment timezone)** for the nightly DM.\n"
                     "When enabled: already-studied days auto-✅ silently; otherwise you get **✅/❌** buttons. "
                     "The settings embed states that tapping **❌** **does not** break your streak — only skipping "
                     "real study does.\n"
@@ -727,7 +727,7 @@ def _embed(idx: int, *, is_lite: bool = False) -> discord.Embed:
                 value=(
                     "`subjects` — top subjects over **30** days with bars + session counts + XP + optional focus stars; "
                     "Discord caps fields so only the **top 24** subjects render (+ “more not shown” line).\n"
-                    "`week` — rolling **7** EST days with goal markers (**✅/🎯/🛌**) explained in the footer.\n"
+                    "`week` — rolling **7** deployment calendar days with goal markers (**✅/🎯/🛌**) explained in the footer.\n"
                     "`focus` — hourly histogram (**AM/PM** split) + insight block; footer reminds you to **star-rate** "
                     "`/study stop` so the model has signal."
                 ),
@@ -736,10 +736,10 @@ def _embed(idx: int, *, is_lite: bool = False) -> discord.Embed:
             .add_field(
                 name="`/export`",
                 value=(
-                    "Builds **`studybot_export_YYYYMMDD_HHMM.zip`** (timestamp in **EST**) with **seven** CSVs: "
+                    "Builds **`studybot_export_YYYYMMDD_HHMM.zip`** (timestamp in **the deployment timezone**) with **seven** CSVs: "
                     "**sessions**, **tasks**, **point transactions**, **reward redemptions**, **check-ins**, "
                     "**badges**, **gacha pulls** — counts echo in the embed fields.\n"
-                    "Sessions timestamps are normalized to **EST strings** inside the CSV for spreadsheet friendliness."
+                    "Sessions timestamps are normalized to **deployment timezone strings** inside the CSV for spreadsheet friendliness."
                 ),
                 inline=False,
             )

@@ -5,10 +5,23 @@
 
 import os
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from dotenv import load_dotenv
 
 # Load this deployment's file before constants are imported. Do not search parents.
 load_dotenv(Path(__file__).with_name(".env"))
+
+
+def required_timezone() -> str:
+    """Require an explicit deployment timezone before any bot state is created."""
+    name = os.getenv("TIMEZONE", "").strip()
+    if not name:
+        raise ValueError("TIMEZONE is required. Set TIMEZONE in .env to an IANA timezone before starting the bot.")
+    try:
+        ZoneInfo(name)
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        raise ValueError("TIMEZONE must be a valid IANA timezone, such as Europe/London or Asia/Tokyo.") from exc
+    return name
 
 
 def env_ids(name: str) -> tuple[int, ...]:
